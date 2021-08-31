@@ -1,4 +1,5 @@
 add_llvm_component_library(LLVMVectorize
+  ExplorativeLV.cpp
   LoadStoreVectorizer.cpp
   LoopVectorizationLegality.cpp
   LoopVectorize.cpp
@@ -21,7 +22,9 @@ add_llvm_component_library(LLVMVectorize
 
   LINK_COMPONENTS
   Analysis
+  CodeGen
   Core
+  Passes
   Support
   TransformUtils
   )

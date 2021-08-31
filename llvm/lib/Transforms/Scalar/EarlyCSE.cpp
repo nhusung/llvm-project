@@ -1649,6 +1649,11 @@ PreservedAnalyses EarlyCSEPass::run(Function &F,
 
   EarlyCSE CSE(F.getParent()->getDataLayout(), TLI, TTI, DT, AC, MSSA);
 
+  // FIXME: For some reason, DT might be broken here when looking at a
+  // function created by ExplorativeLV. For some VFs, not all, and
+  // occurring nondeterministically.
+  DT.recalculate(F);
+
   if (!CSE.run())
     return PreservedAnalyses::all();
 

@@ -290,6 +290,7 @@ void initializeMachineBlockPlacementPass(PassRegistry&);
 void initializeMachineBlockPlacementStatsPass(PassRegistry&);
 void initializeMachineBranchProbabilityInfoPass(PassRegistry&);
 void initializeMachineCSEPass(PassRegistry&);
+void initializeMachineCodeExplorerPass(PassRegistry &);
 void initializeMachineCombinerPass(PassRegistry&);
 void initializeMachineCopyPropagationPass(PassRegistry&);
 void initializeMachineCycleInfoPrinterPassPass(PassRegistry &);

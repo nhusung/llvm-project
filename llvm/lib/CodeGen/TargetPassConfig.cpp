@@ -1270,6 +1270,11 @@ void TargetPassConfig::addMachinePasses() {
   // Add passes that directly emit MI after all other MI passes.
   addPreEmitPass2();
 
+  // FIXME: This should only be added when EnableExplorativeLV has
+  // been set; however the variable for the command line option is
+  // not visible here (by default, pass won't do anything)
+  addPass(createMachineCodeExplorer());
+
   AddingMachinePasses = false;
 }
 

@@ -123,6 +123,7 @@
 #include "llvm/Transforms/Utils/NameAnonGlobals.h"
 #include "llvm/Transforms/Utils/RelLookupTableConverter.h"
 #include "llvm/Transforms/Utils/SimplifyCFGOptions.h"
+#include "llvm/Transforms/Vectorize/ExplorativeLV.h"
 #include "llvm/Transforms/Vectorize/LoopVectorize.h"
 #include "llvm/Transforms/Vectorize/SLPVectorizer.h"
 #include "llvm/Transforms/Vectorize/VectorCombine.h"
@@ -989,6 +990,13 @@ PassBuilder::buildModuleSimplificationPipeline(OptimizationLevel Level,
 /// TODO: Should LTO cause any differences to this set of passes?
 void PassBuilder::addVectorPasses(OptimizationLevel Level,
                                   FunctionPassManager &FPM, bool IsFullLTO) {
+  // Run the exploration pass to determine the best vectorization and
+  // interleaving factor to use
+  // FIXME: This should only be added when EnableExplorativeLV has
+  // been set; however the variable for the command line option is
+  // not visible here (by default, pass won't do anything)
+  FPM.addPass(ExplorativeLVPass(TM, PTO, PGOOpt, PIC));
+  
   FPM.addPass(LoopVectorizePass(
       LoopVectorizeOptions(!PTO.LoopInterleaving, !PTO.LoopVectorization)));
 

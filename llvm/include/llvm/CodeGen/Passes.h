@@ -301,6 +301,11 @@ namespace llvm {
   /// branch folding).
   extern char &GCMachineCodeAnalysisID;
 
+  FunctionPass *createMachineCodeExplorer();
+  FunctionPass *createMachineCodeExplorer(int *Result, std::string File);
+
+  extern char &MachineCodeExplorerID;
+
   /// Creates a pass to print GC metadata.
   ///
   FunctionPass *createGCInfoPrinter(raw_ostream &OS);

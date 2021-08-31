@@ -199,4 +199,5 @@ DUMMY_MACHINE_FUNCTION_PASS("reset-machine-function", ResetMachineFunctionPass, 
 DUMMY_MACHINE_FUNCTION_PASS("machineverifier", MachineVerifierPass, ())
 DUMMY_MACHINE_FUNCTION_PASS("machine-cycles", MachineCycleInfoWrapperPass, ())
 DUMMY_MACHINE_FUNCTION_PASS("print-machine-cycles", MachineCycleInfoPrinterPass, ())
+DUMMY_MACHINE_FUNCTION_PASS("mc-explorer", MachineCodeExplorerPass, ())
 #undef DUMMY_MACHINE_FUNCTION_PASS
