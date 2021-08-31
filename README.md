@@ -1,3 +1,59 @@
+# About This Project
+
+The code on this branch is the outcome of a Master thesis project of the
+Compiler Design Lab at Saarland University.
+
+Based on LLVM release 12.0.1, we implemented an explorative approach to
+the problem of finding the best vectorization and interleaving factor for
+innermost loops.
+
+Roughly, the tool works as follows:
+
+- A pass is inserted immediately before LoopVectorize that retrieves all
+  innermost loops from the function and copies each of them, to insert them
+  into a new function in a new module
+  
+- For every possible combination of vectorization and interleaving factor
+  within the ranges hard-coded in ExplorativeLV.cpp, the copied loop is
+  annotated such that LoopVectorize is forced to choose the factors and runs
+  through the compilation pipeline up until an assembly or object file would
+  be generated
+  
+- A pass at the very end of the backend pipeline calculates a cost estimate
+  for the generated machine code, which is used by the exploration pass to
+  determine the best combination of factors
+  
+- Finally, the combination that has been selected is forced onto the original
+  loop with annotations, such that the loop vectorizer will chose these
+  factors.
+  
+The implementation adds the following hidden command line arguments to
+enable and fine-tune compilation with the exploration tool:
+
+- `enable-explorative-lv`: Set to true in order to activate the tool
+
+- `explore-plain`: By default, the tool's cost calculation only takes into
+  account machine code of blocks that are part of the loop, i.e., blocks
+  whose names contain the strings "`vector.`", "`while.`" or "`for.`". Set
+  this option to true if you want to base your result on the complete machine
+  code output.
+  
+- `explore-divide-by-vf`: Enable this option in order to make the exploration
+  pass divide the cost results by the vectorization factor when comparing
+  them. This shadows LoopVectorize's behaviour when computing vectorization
+  costs and increases the chance of higher factors being used.
+  
+- `explore-with-mca`: Set this argument to true in order to use `llvm-mca`
+  for the machine code cost estimation instead of the machine instruction
+  count. *Note: This only works on architectures for which llvm-mca is
+  available and can analyse machine code that may contain control structures*
+
+More information about the project as well as an evaluation on an embedded
+Arm and an Intel© server architecture can be found here:
+_Thesis link to follow soon_
+
+_From here on follows the original README of the LLVM project_
+
 # The LLVM Compiler Infrastructure
 
 This directory and its sub-directories contain source code for LLVM,

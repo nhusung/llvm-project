@@ -84,6 +84,7 @@
 #include "llvm/Transforms/Utils/NameAnonGlobals.h"
 #include "llvm/Transforms/Utils/SymbolRewriter.h"
 #include "llvm/Transforms/Utils/UniqueInternalLinkageNames.h"
+#include "llvm/Transforms/Vectorize/ExplorativeLV.h"
 #include <memory>
 using namespace clang;
 using namespace llvm;
@@ -91,6 +92,8 @@ using namespace llvm;
 #define HANDLE_EXTENSION(Ext)                                                  \
   llvm::PassPluginLibraryInfo get##Ext##PluginInfo();
 #include "llvm/Support/Extension.def"
+
+extern cl::opt<bool> EnableExplorativeLV;
 
 namespace {
 
@@ -1353,6 +1356,13 @@ void EmitAssemblyHelper::EmitAssemblyWithNewPassManager(
       MPM.addPass(createModuleToFunctionPassAdaptor(MemProfilerPass()));
       MPM.addPass(ModuleMemProfilerPass());
     }
+  }
+
+  if (EnableExplorativeLV) {
+    // All we have to do is to pass on the information about the
+    // vectorization library, then the exploration run can build
+    // its own backend pipeline
+    FAM.setCodeGenOpts((int)CodeGenOpts.getVecLib());
   }
 
   // FIXME: We still use the legacy pass manager to do code generation. We

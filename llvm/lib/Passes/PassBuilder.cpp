@@ -232,6 +232,7 @@
 #include "llvm/Transforms/Utils/UnifyFunctionExitNodes.h"
 #include "llvm/Transforms/Utils/UnifyLoopExits.h"
 #include "llvm/Transforms/Utils/UniqueInternalLinkageNames.h"
+#include "llvm/Transforms/Vectorize/ExplorativeLV.h"
 #include "llvm/Transforms/Vectorize/LoadStoreVectorizer.h"
 #include "llvm/Transforms/Vectorize/LoopVectorize.h"
 #include "llvm/Transforms/Vectorize/SLPVectorizer.h"
@@ -1244,6 +1245,13 @@ PassBuilder::buildModuleOptimizationPipeline(OptimizationLevel Level,
   // Populates the VFABI attribute with the scalar-to-vector mappings
   // from the TargetLibraryInfo.
   OptimizePM.addPass(InjectTLIMappings());
+
+  // Run the exploration pass to determine the best vectorization and
+  // interleaving factor to use
+  // FIXME: This should only be added when EnableExplorativeLV has
+  // been set; however the variable for the command line option is
+  // not visible here (by default, pass won't do anything)
+  OptimizePM.addPass(ExplorativeLVPass(TM, PTO, PGOOpt, PIC));
 
   // Now run the core loop vectorizer.
   OptimizePM.addPass(LoopVectorizePass(

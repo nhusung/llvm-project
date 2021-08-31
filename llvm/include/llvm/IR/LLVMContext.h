@@ -324,6 +324,14 @@ public:
   /// LLVMContext is used by compilation.
   void setOptPassGate(OptPassGate&);
 
+  int getMCInstCount() { return MCInstCount; }
+
+  void setMCInstCount(int Count) { MCInstCount = Count; }
+
+  bool isScalarExploration() { return ScalarExploration; }
+
+  void setScalarExploration(bool To) { ScalarExploration = To; }
+
 private:
   // Module needs access to the add/removeModule methods.
   friend class Module;
@@ -334,6 +342,10 @@ private:
 
   /// removeModule - Unregister a module from this context.
   void removeModule(Module*);
+
+  int MCInstCount;
+
+  bool ScalarExploration;
 };
 
 // Create wrappers for C Binding types (see CBindingWrapping.h).
