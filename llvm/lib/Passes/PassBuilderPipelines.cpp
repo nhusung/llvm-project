@@ -224,6 +224,8 @@ extern cl::opt<bool> EnableMatrix;
 
 extern cl::opt<bool> DisablePreInliner;
 extern cl::opt<int> PreInlineThreshold;
+
+extern cl::opt<bool> EnableExplorativeLV;
 } // namespace llvm
 
 void PassBuilder::invokePeepholeEPCallbacks(FunctionPassManager &FPM,
@@ -992,10 +994,8 @@ void PassBuilder::addVectorPasses(OptimizationLevel Level,
                                   FunctionPassManager &FPM, bool IsFullLTO) {
   // Run the exploration pass to determine the best vectorization and
   // interleaving factor to use
-  // FIXME: This should only be added when EnableExplorativeLV has
-  // been set; however the variable for the command line option is
-  // not visible here (by default, pass won't do anything)
-  FPM.addPass(ExplorativeLVPass(TM, PTO, PGOOpt, PIC));
+  if (EnableExplorativeLV) 
+    FPM.addPass(ExplorativeLVPass(TM, PTO, PGOOpt));
   
   FPM.addPass(LoopVectorizePass(
       LoopVectorizeOptions(!PTO.LoopInterleaving, !PTO.LoopVectorization)));

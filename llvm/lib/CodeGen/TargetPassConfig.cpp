@@ -217,6 +217,12 @@ static cl::opt<CFLAAType> UseCFLAA(
                clEnumValN(CFLAAType::Both, "both",
                           "Enable both variants of CFL-AA")));
 
+namespace llvm {
+// Whether to enable the MachineCodeExplorer for explorative vectorization
+extern cl::opt<bool> EnableExplorativeLV;
+extern cl::opt<bool> ExplorativeLVmca;
+} // namespace llvm
+
 /// Option names for limiting the codegen pipeline.
 /// Those are used in error reporting and we didn't want
 /// to duplicate their names all over the place.
@@ -1270,10 +1276,13 @@ void TargetPassConfig::addMachinePasses() {
   // Add passes that directly emit MI after all other MI passes.
   addPreEmitPass2();
 
-  // FIXME: This should only be added when EnableExplorativeLV has
-  // been set; however the variable for the command line option is
-  // not visible here (by default, pass won't do anything)
-  addPass(createMachineCodeExplorer());
+  // Add MachineCodeExplorer pass if we perform explorative vectorization and do
+  // not use another metric
+  if (EnableExplorativeLV && !ExplorativeLVmca) {
+    // TODO: It would be more elegant to check that we are in the loop
+    // compilation pipeline but not in the main pipeline.
+    addPass(createMachineCodeExplorer());
+  }
 
   AddingMachinePasses = false;
 }

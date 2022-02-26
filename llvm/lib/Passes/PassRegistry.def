@@ -364,7 +364,7 @@ FUNCTION_PASS("view-cfg-only", CFGOnlyViewerPass())
 FUNCTION_PASS("transform-warning", WarnMissedTransformationsPass())
 FUNCTION_PASS("tsan", ThreadSanitizerPass())
 FUNCTION_PASS("memprof", MemProfilerPass())
-FUNCTION_PASS("explorative-lv", ExplorativeLVPass(TM, PTO, PGOOpt, PIC))
+FUNCTION_PASS("explorative-lv", ExplorativeLVPass(TM, PTO, PGOOpt))
 #undef FUNCTION_PASS
 
 #ifndef FUNCTION_PASS_WITH_PARAMS

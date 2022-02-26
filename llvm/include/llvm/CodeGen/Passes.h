@@ -301,9 +301,14 @@ namespace llvm {
   /// branch folding).
   extern char &GCMachineCodeAnalysisID;
 
+  /// MachineCodeExplorer - Target-independent pass to analyze machine code
+  /// and return a cost estimate, based on the machine instruction count, to the
+  /// explorer instance.
   FunctionPass *createMachineCodeExplorer();
-  FunctionPass *createMachineCodeExplorer(int *Result, std::string File);
 
+  /// MachineCodeExplorer - Target-independent pass to analyze machine code
+  /// and return a cost estimate, based on the machine instruction count, to the
+  /// explorer instance.
   extern char &MachineCodeExplorerID;
 
   /// Creates a pass to print GC metadata.

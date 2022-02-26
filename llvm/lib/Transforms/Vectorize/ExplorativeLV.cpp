@@ -27,7 +27,6 @@
 #include "llvm/Analysis/CFG.h"
 #include "llvm/Analysis/LoopIterator.h"
 #include "llvm/Analysis/ScalarEvolution.h"
-#include "llvm/CodeGen/MachineCodeExplorer.h"
 #include "llvm/CodeGen/Passes.h"
 #include "llvm/IR/Argument.h"
 #include "llvm/IR/DebugInfo.h"
@@ -45,9 +44,17 @@ using namespace llvm;
 #define DEBUG_TYPE "explorative-lv"
 
 namespace llvm {
+
 cl::opt<bool> EnableExplorativeLV(
     "enable-explorative-lv", cl::Hidden, cl::init(false),
     cl::desc("Enable loop vectorization by exploratively determining the VF"));
+
+// Set to true to use llvm-mca for machine code evaluation, to false to use
+// the resulting code's size (default: code size)
+cl::opt<bool> ExplorativeLVmca(
+    "explore-with-mca", cl::Hidden, cl::init(false),
+    cl::desc("Use llvm-mca for machine code evaluation in loop exploration"));
+
 } // namespace llvm
 
 static cl::opt<bool>
@@ -59,12 +66,6 @@ static cl::opt<bool>
     ExploreDivVF("explore-divide-by-vf", cl::Hidden, cl::init(false),
                  cl::desc("If loop exploration is enabled, aggregate "
                           "the cost results by the VF"));
-
-// Set to true to use llvm-mca for machine code evaluation, to false to use
-// the resulting code's size (default: code size)
-static cl::opt<bool> ExplorativeLVmca(
-    "explore-with-mca", cl::Hidden, cl::init(false),
-    cl::desc("Use llvm-mca for machine code evaluation in loop exploration"));
 
 // Function copied and reduced from LoopVectorize.cpp
 static void collectSupportedLoops(Loop &L, LoopInfo *LI,
@@ -135,7 +136,7 @@ static void createNewLoopFunction(std::unique_ptr<Module> *M, Function *OldFunc,
           // Should be handled below
           continue;
 
-        if (dyn_cast<BasicBlock>(Op))
+        if (isa<BasicBlock>(Op))
           // Ignore blocks, we already dealt with them
           continue;
 
@@ -518,6 +519,69 @@ std::unique_ptr<Module> NewMakeLoopOnlyModule(Function *F, Loop *L,
   return New;
 }
 
+// Executes the command line and returns the total output it sees
+// Based on a Stackoverflow solution here:
+// https://stackoverflow.com/questions/478898/how-do-i-execute-a-command
+// -and-get-the-output-of-the-command-within-c-using-po
+static std::string exec(const char *Cmd) {
+  std::array<char, 128> Buffer;
+  std::string Res;
+  std::unique_ptr<FILE, decltype(&pclose)> Pipe(popen(Cmd, "r"), pclose);
+  assert(Pipe &&
+         "MachineCodeExplorer cannot open a command line to execute llvm-mca");
+  while (fgets(Buffer.data(), Buffer.size(), Pipe.get()) != nullptr) {
+    Res += Buffer.data();
+  }
+  return Res;
+}
+
+// The more complex approach, using the runtime estimation mechanisms
+// already present in LLVM: llvm-mca
+// (To be called from the pass that performs the exploration)
+// FIXME: This only works when the compilation is executed from within
+// the build folder of llvm-project
+static int performMCACostCalc(std::string FileName, std::string TargetCPU,
+                              std::string TargetTriple,
+                              raw_pwrite_stream *OutStream) {
+  // Before running the analyser, reduce the code we look at to the actual
+  // loop code. The script will try to find a vector loop first, but fall back
+  // to the for/while loop if no vector loop is found
+  // FIXME: This won't work on any architecture other than x86
+  // Uncomment and change exec call if you really want to use it!
+  /*std::string Command = "python ../llvm/lib/CodeGen/ExtractAssemblyLoop.py ";
+  std::string ReducedFileName = "loop.tmp";
+  Command.append(FileName);
+  Command.append(" ");
+  Command.append(ReducedFileName);*/
+
+  // Build the most specific command line we can generate from
+  // the info in TM
+  // First, let's wait for a second to make sure printing the file has finished
+  std::string CommandMCA = "bin/llvm-mca";
+  CommandMCA.append(" --mcpu=" + TargetCPU);
+  CommandMCA.append(" --mtriple=" + TargetTriple);
+  CommandMCA.append(" --instruction-info=false");
+  CommandMCA.append(" --resource-pressure=false ");
+  CommandMCA.append(FileName);
+  // Immediately reduce the output to the part we're interested in
+  CommandMCA.append(" | grep 'Total Cycles' | cut -f2- -d:");
+
+  // Retrieve result
+  /*Command.append(" && ");
+  Command.append(CommandMCA);
+  std::string Output = exec(Command.c_str());*/
+  std::string Output = exec(CommandMCA.c_str());
+
+  // Transform result to a number
+  int Result = std::atoi(Output.c_str());
+
+  // And last, remove the tmp file
+  std::string Remove = "rm " + FileName;
+  exec(Remove.c_str());
+
+  return Result;
+}
+
 // Add to the given pass manager everything we need to simulate our backend
 // pipeline
 raw_pwrite_stream *ExplorativeLVPass::init(legacy::PassManager &PM, int VecOps,
@@ -698,9 +762,9 @@ PreservedAnalyses ExplorativeLVPass::run(Function &F,
           }
           // Perform the cost calculation after the pipeline is deleted, to
           // make sure the assembly printer has finished
-          Result = MachineCodeExplorer::PerformMCACostCalc(
-              AssemblyFileName, TM->getTargetCPU().str(), TargetTriple.str(),
-              OutStream);
+          Result =
+              performMCACostCalc(AssemblyFileName, TM->getTargetCPU().str(),
+                                 TargetTriple.str(), OutStream);
 
         } else {
           Function *LoopFunc = LoopModule->getFunction(newFuncName);

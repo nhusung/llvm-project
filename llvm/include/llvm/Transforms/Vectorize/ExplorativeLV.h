@@ -35,9 +35,8 @@ class ExplorativeLVPass : public PassInfoMixin<ExplorativeLVPass> {
 
 public:
   ExplorativeLVPass(TargetMachine *TM, PipelineTuningOptions PTO,
-                    Optional<PGOOptions> PGOOpt,
-                    PassInstrumentationCallbacks *PIC)
-      : TM(TM), PTO(PTO), PGOOpt(PGOOpt), PIC(PIC) {}
+                    Optional<PGOOptions> PGOOpt)
+      : TM(TM), PTO(PTO), PGOOpt(PGOOpt) {}
 
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
 
@@ -56,7 +55,6 @@ private:
   TargetMachine *TM;
   PipelineTuningOptions PTO;
   Optional<PGOOptions> PGOOpt;
-  PassInstrumentationCallbacks *PIC;
 };
 
 } // namespace llvm
