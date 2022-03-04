@@ -311,9 +311,9 @@ public:
   /// Whether typed pointers are supported. If false, all pointers are opaque.
   bool supportsTypedPointers() const;
 
-  int getMCInstCount() { return MCInstCount; }
+  unsigned getMCInstCount() { return MCInstCount; }
 
-  void setMCInstCount(int Count) { MCInstCount = Count; }
+  void setMCInstCount(unsigned Count) { MCInstCount = Count; }
 
   bool isScalarExploration() { return ScalarExploration; }
 
@@ -330,7 +330,7 @@ private:
   /// removeModule - Unregister a module from this context.
   void removeModule(Module *);
 
-  int MCInstCount;
+  unsigned MCInstCount;
 
   bool ScalarExploration;
 };

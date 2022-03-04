@@ -13,7 +13,6 @@
 
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/Passes.h"
-#include "llvm/IR/Function.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/Target/TargetMachine.h"
 
@@ -28,7 +27,6 @@ struct MachineCodeExplorer : public MachineFunctionPass {
   MachineCodeExplorer() : MachineFunctionPass(ID) {
     initializeMachineCodeExplorerPass(*PassRegistry::getPassRegistry());
   }
-  int getCodeSizeEvaluation(MachineFunction &Fn, bool OnlyLoop);
 
   bool runOnMachineFunction(MachineFunction &F) override;
 };
@@ -37,8 +35,7 @@ struct MachineCodeExplorer : public MachineFunctionPass {
 
 // The simple, code-size bound approach: count how
 // many MachineInsts the function contains
-int MachineCodeExplorer::getCodeSizeEvaluation(MachineFunction &Fn,
-                                               bool OnlyLoop) {
+static unsigned getCodeSizeEvaluation(MachineFunction &Fn, bool OnlyLoop) {
 
   if (!Fn.getFunction().getContext().isScalarExploration()) {
     bool Vectorized = false;
@@ -51,7 +48,7 @@ int MachineCodeExplorer::getCodeSizeEvaluation(MachineFunction &Fn,
       }
     }
     if (!Vectorized)
-      return -1;
+      return UINT_MAX;
   }
 
   if (!OnlyLoop)

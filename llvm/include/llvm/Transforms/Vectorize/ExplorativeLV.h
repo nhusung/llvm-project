@@ -23,11 +23,8 @@
 #ifndef LLVM_TRANSFORMS_EXPLORATIVELV_H
 #define LLVM_TRANSFORMS_EXPLORATIVELV_H
 
-#include "llvm/Analysis/LoopInfo.h"
 #include "llvm/IR/PassManager.h"
-#include "llvm/Pass.h"
 #include "llvm/Passes/PassBuilder.h"
-#include "llvm/Transforms/Scalar/LoopPassManager.h"
 
 namespace llvm {
 

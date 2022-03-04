@@ -21,21 +21,12 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Transforms/Vectorize/ExplorativeLV.h"
-#include "llvm/ADT/Triple.h"
 #include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/Analysis/CFG.h"
 #include "llvm/Analysis/LoopIterator.h"
 #include "llvm/Analysis/ScalarEvolution.h"
-#include "llvm/CodeGen/Passes.h"
-#include "llvm/IR/Argument.h"
 #include "llvm/IR/DebugInfo.h"
-#include "llvm/IR/GlobalValue.h"
-#include "llvm/IR/GlobalVariable.h"
-#include "llvm/IR/IRBuilder.h"
-#include "llvm/IR/LegacyPassManager.h"
-#include "llvm/IR/PassInstrumentation.h"
-#include "llvm/Passes/PassBuilder.h"
 #include "llvm/Passes/StandardInstrumentations.h"
 #include "llvm/Transforms/ObjCARC.h"
 #include "llvm/Transforms/Utils/Cloning.h"
@@ -93,73 +84,41 @@ static bool
 definedInRegion(const llvm::SmallPtrSetImpl<const llvm::BasicBlock *> &Blocks,
                 Value *V) {
   if (Instruction *I = dyn_cast<Instruction>(V))
-    if (Blocks.count(I->getParent()))
-      return true;
+    return Blocks.contains(I->getParent());
   return false;
 }
 
 // This function uses a lot of code (and comments) from Utils/CloneFunction.cpp,
 // but also from IPO/LoopExtractor.cpp resp. Utils/CodeExtractor.cpp
-static void createNewLoopFunction(std::unique_ptr<Module> *M, Function *OldFunc,
-                                  Loop *L, ValueToValueMapTy &VMap,
-                                  std::string NewFuncName) {
+static void createNewLoopFunction(Module *M, const Function *OldFunc, Loop *L,
+                                  ValueToValueMapTy &VMap,
+                                  const StringRef NewFuncName) {
+  // The core idea is to generate a function containing the basic blocks of the
+  // loop.  Values used inside the loop and defined outside are parameters to
+  // the function.  For each values defined inside the loop and used outside we
+  // generate an output parameter to produce an observable side-effect such that
+  // the code is not optimized away.
 
-  // Collect the variables from outside the loop that are being used
-  // Collect the arguments we'll have to add, and what maps to them
-  SmallVector<Value *> ArgumentVMap;
-  std::map<std::string, int> Arguments;
-  // We require a type vector to build the function, may as well collect them
-  // here
-  SmallVector<Type *> ArgumentTypes;
-  // FIXME: Pushing the old func args too, even though an Argument is not a
-  // Value
-  for (Argument &A : OldFunc->args()) {
-    ArgumentVMap.push_back(&A);
-    ArgumentTypes.push_back(A.getType());
-    Arguments[A.getName().str()] = ArgumentTypes.size() - 1;
-  }
+  SmallVector<Value *> ArgVMap;
+  SmallPtrSet<Value *, 32> ArgSet;
   SmallVector<Instruction *> Outputs;
-  std::set<unsigned int> MetaNodes;
 
   for (BasicBlock *BB : L->getBlocks()) {
     for (Instruction &I : *BB) {
-      unsigned int End = I.getNumOperands();
-
-      CallInst *CI = dyn_cast<CallInst>(&I);
-      if (CI && CI->isTailCall())
-        // If this is a tail call, the last operand should be its "name",
-        // so ignore it
-        End--;
-      for (unsigned int i = 0; i < End; i++) {
-        Value *Op = I.getOperand(i);
-        if (Op->getType()->isMetadataTy())
-          // Should be handled below
+      // Used inside loop and defined outside?
+      for (Value *Op : I.operand_values()) {
+        Instruction *OpInst = dyn_cast<Instruction>(Op);
+        if (OpInst) {
+          if (L->getBlocksSet().contains(OpInst->getParent()))
+            continue;
+        } else if (!isa<Argument>(Op) || ArgSet.contains(Op)) {
           continue;
-
-        if (isa<BasicBlock>(Op))
-          // Ignore blocks, we already dealt with them
-          continue;
-
-        std::string Name = Op->getName().str();
-        if (Arguments.find(Name) != Arguments.end() || dyn_cast<BasicBlock>(Op))
-          continue;
-        if (Instruction *OpInst = dyn_cast<Instruction>(Op)) {
-          if (!L->getBlocksSet().contains(OpInst->getParent())) {
-            ArgumentVMap.push_back(Op);
-            ArgumentTypes.push_back(OpInst->getType());
-            Arguments[Name] = ArgumentTypes.size() - 1;
-          }
-        } else if (!dyn_cast<Constant>(Op) || dyn_cast<GlobalVariable>(Op)) {
-          // Things that are global, or function arguments used by this loop are
-          // not caught by the above instruction thing, but must still be fixed
-          ArgumentVMap.push_back(Op);
-          ArgumentTypes.push_back(Op->getType());
-          Arguments[Name] = ArgumentTypes.size() - 1;
         }
+        ArgSet.insert(Op);
+        ArgVMap.push_back(Op);
       }
-      // Check whether the instruction is being used outside the loop; if
-      // yes, we'll add it to the arguments so LLVM believes us that
-      // this code shouldn't be optimized away
+
+      // Defined inside loop and used outside?
       for (User *U : I.users())
         if (!definedInRegion(L->getBlocksSet(), U)) {
           Outputs.push_back(&I);
@@ -168,269 +127,205 @@ static void createNewLoopFunction(std::unique_ptr<Module> *M, Function *OldFunc,
     }
   }
 
-  // This function returns void, outputs via stores in function arguments.
-  Type *RetTy = Type::getVoidTy(OldFunc->getContext());
+  SmallVector<Type *> ArgTys;
+  ArgTys.reserve(ArgVMap.size() + Outputs.size());
+  for (Value *V : ArgVMap)
+    ArgTys.push_back(V->getType());
+  for (Instruction *I : Outputs)
+    ArgTys.push_back(PointerType::getUnqual(I->getType()));
 
-  for (Value *V : Outputs)
-    ArgumentTypes.push_back(PointerType::getUnqual(V->getType()));
+  // This function returns void, no varargs
+  FunctionType *LoopFuncTy =
+      FunctionType::get(Type::getVoidTy(M->getContext()), ArgTys, false);
 
-  Function *LoopFunction = Function::Create(
-      FunctionType::get(RetTy, ArgumentTypes, false), OldFunc->getLinkage(),
-      OldFunc->getAddressSpace(), NewFuncName, M->get());
+  Function *LoopFunc =
+      Function::Create(LoopFuncTy, GlobalValue::ExternalLinkage,
+                       OldFunc->getAddressSpace(), NewFuncName, M);
+
+  /* Insert the generated function arguments into the VMap, add names */ {
+    auto *ArgPtr = LoopFunc->arg_begin();
+    for (Value *OldV : ArgVMap) {
+      VMap[OldV] = ArgPtr;
+      VMap[ArgPtr] = ArgPtr;
+      if (OldV->hasName())
+        ArgPtr->setName(OldV->getName() + ".i");
+      ++ArgPtr;
+    }
+    for (Instruction *I : Outputs) {
+      VMap[ArgPtr] = ArgPtr;
+      if (I->hasName())
+        ArgPtr->setName(I->getName() + ".o");
+      ++ArgPtr;
+    }
+  }
 
   // Introduce empty label at the beginning of the function, and at the
   // end of the function, so we can refer to "before" and "after"
-  IRBuilder<> Builder(LoopFunction->getContext());
-  BasicBlock *Begin = BasicBlock::Create(LoopFunction->getContext(),
-                                         "loop_begin", LoopFunction);
-  Builder.SetInsertPoint(Begin);
-  VMap[Begin] = Begin;
+  BasicBlock *BeginBB =
+      BasicBlock::Create(LoopFunc->getContext(), "loop_begin", LoopFunc);
+  VMap[BeginBB] = BeginBB;
 
-  // Map arguments of old function to arguments of new function
-  for (unsigned int i = 0; i < OldFunc->arg_size(); i++) {
-    VMap[OldFunc->getArg(i)] = LoopFunction->getArg(i);
-  }
-  // Insert the generated function arguments into the VMap
-  for (unsigned int i = OldFunc->arg_size(); i < ArgumentVMap.size(); i++) {
-    Value *V = ArgumentVMap[i];
-    VMap[V] = LoopFunction->getArg(Arguments[V->getName().str()]);
-  }
+  // Copy argument attributes (~~> CloneFunctionInto)
+  AttributeList LoopAttrs = LoopFunc->getAttributes();
+  // We do not clone function attributes, since the original function might
+  // fulfill properties that the new one does not.
 
-  AttributeList NewAttrs = LoopFunction->getAttributes();
-  LoopFunction->setAttributes(NewAttrs);
-
-  SmallVector<AttributeSet, 4> NewArgAttrs(LoopFunction->arg_size());
+  SmallVector<AttributeSet, 4> LoopArgAttrs(LoopFunc->arg_size());
   AttributeList OldAttrs = OldFunc->getAttributes();
-
-  // Clone any argument attributes that are present in the VMap.
   for (const Argument &OldArg : OldFunc->args()) {
-    if (!VMap[&OldArg])
+    if (VMap.count(&OldArg) == 0)
       continue;
     if (Argument *NewArg = dyn_cast<Argument>(VMap[&OldArg])) {
-      NewArgAttrs[NewArg->getArgNo()] =
+      LoopArgAttrs[NewArg->getArgNo()] =
           OldAttrs.getParamAttrs(OldArg.getArgNo());
     }
   }
 
-  LoopFunction->setAttributes(
-      AttributeList::get(LoopFunction->getContext(),
-                         NewAttrs.getFnAttrs(),  // OldAttrs.getFnAttributes(),
-                         NewAttrs.getRetAttrs(), // OldAttrs.getRetAttributes(),
-                         NewArgAttrs));
+  LoopFunc->setAttributes(
+      AttributeList::get(LoopFunc->getContext(), LoopAttrs.getFnAttrs(),
+                         LoopAttrs.getRetAttrs(), LoopArgAttrs));
 
-  // When we remap instructions within the same module, we want to avoid
-  // duplicating inlined DISubprograms, so record all subprograms we find as we
-  // duplicate instructions and then freeze them in the MD map. We also record
-  // information about dbg.value and dbg.declare to avoid duplicating the
-  // types.
   DebugInfoFinder DIFinder;
-
-  DISubprogram *SP = OldFunc->getSubprogram();
-  if (SP) {
-    // Add mappings for some DebugInfo nodes that we don't want duplicated
-    // even if they're distinct.
-    auto &MD = VMap.MD();
-    MD[SP->getUnit()].reset(SP->getUnit());
-    MD[SP->getType()].reset(SP->getType());
-    MD[SP->getFile()].reset(SP->getFile());
-    // If we're not cloning into the same module, no need to clone the
-    // subprogram
-    MD[SP].reset(SP);
-  }
 
   // From here on we need to deviate from CloneFunctionInto to only clone
   // the loop, not a whole function.
 
   // Loop over all of the basic blocks in the loop, cloning them as
   // appropriate.
-  bool first = true;
+  BasicBlock *NewLoopHeader = nullptr;
   for (const BasicBlock *BB : L->getBlocks()) {
 
     // Create a new basic block and copy instructions into it!
-    BasicBlock *CBB =
-        CloneBasicBlock(BB, VMap, "_suffix", LoopFunction, nullptr, &DIFinder);
-
-    if (first) {
-      Builder.SetInsertPoint(Begin);
-      BranchInst *BI = Builder.CreateBr(CBB);
-      VMap[BI] = BI;
-      first = false;
-    }
+    BasicBlock *NewBB =
+        CloneBasicBlock(BB, VMap, ".l", LoopFunc, nullptr, &DIFinder);
+    if (!NewLoopHeader)
+      NewLoopHeader = NewBB;
 
     // Add basic block mapping.
-    VMap[BB] = CBB;
+    VMap[BB] = NewBB;
     // And map block to itself because the remapping step
     // will try to retrieve it
-    VMap[CBB] = CBB;
+    VMap[NewBB] = NewBB;
 
     // Need to map each new instruction clone to itself, so VMap doesn't
     // break when later stuff is looking at instructions we generated, not
     // cloned
-    for (Instruction &I : *CBB)
+    for (Instruction &I : *NewBB)
       VMap[&I] = &I;
 
     // It is only legal to clone a function if a block address within that
     // function is never referenced outside of the function.  Given that, we
     // want to map block addresses from the old function to block addresses in
-    // the clone. (This is different from the generic ValueMapper
-    // implementation, which generates an invalid blockaddress when
+    // the clone.  (This is different from the generic ValueMapper
+    // implementation, which generates an invalid BlockAddress when
     // cloning a function.)
     if (BB->hasAddressTaken()) {
       Constant *OldBBAddr = BlockAddress::get(const_cast<Function *>(OldFunc),
                                               const_cast<BasicBlock *>(BB));
-      VMap[OldBBAddr] = BlockAddress::get(LoopFunction, CBB);
-    }
-
-    // Change any returns to return void
-    if (ReturnInst *RI = dyn_cast<ReturnInst>(CBB->getTerminator())) {
-      ReturnInst::Create(LoopFunction->getContext(), nullptr, CBB);
-      RI->removeFromParent();
+      VMap[OldBBAddr] = BlockAddress::get(LoopFunc, NewBB);
     }
   }
 
-  for (DISubprogram *ISP : DIFinder.subprograms())
-    if (ISP != SP)
-      VMap.MD()[ISP].reset(ISP);
+  BasicBlock *EndBB =
+      BasicBlock::Create(LoopFunc->getContext(), "loop_end", LoopFunc, nullptr);
+  ReturnInst *Ret = ReturnInst::Create(LoopFunc->getContext(), EndBB);
+  VMap[EndBB] = EndBB;
+  VMap[Ret] = Ret;
 
-  for (DICompileUnit *CU : DIFinder.compile_units())
-    VMap.MD()[CU].reset(CU);
+  // For each edge that exits the loop: create store block that stores all live
+  // variables in the output parameters.
+  Function::arg_iterator OutputArgsBegin = LoopFunc->arg_begin();
+  std::advance(OutputArgsBegin, ArgVMap.size());
+  for (BasicBlock *BB : L->blocks()) {
+    if (!L->isLoopExiting(BB))
+      continue;
 
-  for (DIType *Type : DIFinder.types())
-    VMap.MD()[Type].reset(Type);
+    Instruction *Term = BB->getTerminator();
+    BasicBlock *NewBB = dyn_cast<BasicBlock>(VMap[BB]);
+    assert(NewBB && "block mapping missing");
+    Instruction *NewTerm = NewBB->getTerminator();
 
-  BasicBlock *End = BasicBlock::Create(LoopFunction->getContext(), "loop_end",
-                                       LoopFunction, nullptr);
-  VMap[End] = End;
+    for (unsigned Idx = 0, Num = Term->getNumSuccessors(); Idx < Num; ++Idx) {
+      BasicBlock *SuccBB = Term->getSuccessor(Idx);
+      if (L->getBlocksSet().contains(SuccBB))
+        continue; // Not an exiting edge
+      assert(SuccBB->getParent() == OldFunc);
 
-  // Following LoopExtractor's example, use the arguments to store values
-  // that are used outside of the loop
-  Function::arg_iterator LoopFuncArgs = LoopFunction->arg_begin();
-  std::advance(LoopFuncArgs, OldFunc->arg_size());
-  unsigned int NumInputs = ArgumentVMap.size();
-  SmallVector<BasicBlock *> ExitingBlocks;
-  L->getExitingBlocks(ExitingBlocks);
-  for (unsigned int j = 0;; j++) {
-    if (j == LoopFunction->arg_size())
-      break;
-    if (j < NumInputs) {
-    } else {
-      // First make sure VMap knows this func arg
-      Value *FuncArg = LoopFunction->getArg(j);
-      VMap[FuncArg] = FuncArg;
-      Instruction *I = Outputs[j - NumInputs];
-      assert(I && "If this is no instruction we did something wrong");
+      BasicBlock *StoreBB = BasicBlock::Create(LoopFunc->getContext(),
+                                               "store_block", LoopFunc, EndBB);
+      VMap[StoreBB] = StoreBB;
+      NewTerm->setSuccessor(Idx, StoreBB);
 
-      // Check the exiting blocks to find one that is reachable from the
-      // instruction, such that we can build an artificial successor that
-      // can do the store for us (preserving LCSSA form using a phi and
-      // preserving reductions because it's outside the loop)
-      // We do the analysis in the original loop, then use VMap to get
-      // the instructions and blocks we'll want to change
-      for (BasicBlock *BB : ExitingBlocks) {
-        if (isPotentiallyReachable(BB->getTerminator(), I)) {
-          BasicBlock *TargetBlock = dyn_cast<BasicBlock>(VMap[BB]);
-          BranchInst *TargetBranch =
-              dyn_cast<BranchInst>(TargetBlock->getTerminator());
-          if (!TargetBranch)
-            // It could e.g. be a return, let's not mess with that
+      Function::arg_iterator OutputArg = OutputArgsBegin;
+      for (Instruction *I : Outputs) {
+        assert(I->getParent()->getParent() == OldFunc);
+        for (User *U : I->users()) {
+          Instruction *UI = dyn_cast<Instruction>(U);
+          // A user might be in the new function as we have not remapped the
+          // operands yet.  Just ignore these users.
+          if (!UI || UI->getFunction() != OldFunc ||
+              !isPotentiallyReachable(SuccBB, UI->getParent()))
             continue;
-          // Find the (one) successor that leaves the loop, that we have
-          // to change to our new block
-          bool Done = false;
-          for (unsigned int i = 0; i < TargetBranch->getNumSuccessors(); i++) {
-            // All blocks inside the loop we cloned, and set a VMap entry
-            // for them, so if we find one that is not in VMap it's not in the
-            // loop
-            if (!VMap[TargetBranch->getSuccessor(i)]) {
-              Instruction *TargetInstruction = dyn_cast<Instruction>(VMap[I]);
-              BasicBlock *PhiBlock = BasicBlock::Create(
-                  LoopFunction->getContext(), "store_block", LoopFunction, End);
-              VMap[PhiBlock] = PhiBlock;
 
-              TargetBranch->setSuccessor(i, PhiBlock);
-              PHINode *LcssaPhi = PHINode::Create(TargetInstruction->getType(),
-                                                  1, "lcssa_phi", PhiBlock);
-              LcssaPhi->addIncoming(TargetInstruction, TargetBlock);
-              Instruction *NewStore =
-                  new StoreInst(LcssaPhi, FuncArg, PhiBlock);
-              BranchInst *B = BranchInst::Create(End, PhiBlock);
-              // Add all the new instructions to VMap
-              VMap[LcssaPhi] = LcssaPhi;
-              VMap[NewStore] = NewStore;
-              VMap[B] = B;
+          // Use a phi to preserve LCSSA form
+          PHINode *LCSSAPhi =
+              PHINode::Create(UI->getType(), 1, "lcssa_phi", StoreBB);
+          LCSSAPhi->addIncoming(VMap[I], NewBB);
+          StoreInst *Store = new llvm::StoreInst(LCSSAPhi, OutputArg, StoreBB);
+          VMap[LCSSAPhi] = LCSSAPhi;
+          VMap[Store] = Store;
 
-              Done = true;
-              break;
-            }
-          }
-          if (Done)
-            break;
+          break;
         }
+        ++OutputArg;
       }
-    }
-    ++LoopFuncArgs;
-  }
-  Builder.SetInsertPoint(End);
-  Builder.CreateRetVoid();
 
-  const auto RemapFlag = RF_None;
+      BranchInst *EndBranch = BranchInst::Create(EndBB, StoreBB);
+      VMap[EndBranch] = EndBranch;
+    }
+  }
+
+  BranchInst *Branch = BranchInst::Create(NewLoopHeader, BeginBB);
+  VMap[Branch] = Branch;
+
+  // The first basic block might have had multiple predecessors that were
+  // not part of the loop.  In our new setup, they are all replaced by
+  // BeginBB.  Update the PHINodes accordingly.  Since we have a (natural)
+  // loop, no other basic block than the loop header has predecedecessors
+  // outside the loop.
+  for (PHINode &P : NewLoopHeader->phis()) {
+    for (BasicBlock **It = P.block_begin(), **End = P.block_end(); It != End;
+         It++) {
+      if (VMap.count(*It) == 0)
+        *It = BeginBB;
+    }
+  }
+
   // Duplicate the metadata that is attached to the cloned function.
   // Subprograms/CUs/types that were already mapped to themselves won't be
   // duplicated.
   SmallVector<std::pair<unsigned, MDNode *>, 1> MDs;
   OldFunc->getAllMetadata(MDs);
   for (auto MD : MDs) {
-    LoopFunction->addMetadata(MD.first,
-                              *MapMetadata(MD.second, VMap, RemapFlag));
+    LoopFunc->addMetadata(MD.first, *MapMetadata(MD.second, VMap));
   }
 
   // Loop over all of the instructions in the new function, fixing up operand
   // references as we go. This uses VMap to do all the hard work.
-  for (BasicBlock &BB : *LoopFunction)
+  for (BasicBlock &BB : *LoopFunc) {
     // Loop over all instructions, fixing each one as we find it...
-    for (Instruction &II : BB) {
-
-      // Special treatment for instructions that might refer to blocks
-      // we don't have in our VMap
-      // This is a simplification, but Phis need to be reachable from the
-      // incoming block, so take Begin, the others can simply default to End
-      PHINode *P = dyn_cast<PHINode>(&II);
-      if (P)
-        for (unsigned int i = 0; i < P->getNumIncomingValues(); i++) {
-          BasicBlock *SomeBlock = P->getIncomingBlock(i);
-          if (!VMap[SomeBlock])
-            P->setIncomingBlock(i, Begin);
-        }
-      BranchInst *B = dyn_cast<BranchInst>(&II);
-      if (B)
-        for (unsigned int i = 0; i < B->getNumSuccessors(); i++) {
-          BasicBlock *SomeBlock = B->getSuccessor(i);
-          if (!VMap[SomeBlock])
-            B->setSuccessor(i, End);
-        }
-      SwitchInst *S = dyn_cast<SwitchInst>(&II);
-      if (S) {
-        BasicBlock *SomeBlock = S->getDefaultDest();
-        if (!VMap[SomeBlock])
-          S->setDefaultDest(End);
-        for (unsigned int i = 0; i < S->getNumSuccessors(); i++) {
-          BasicBlock *SomeBlock = S->getSuccessor(i);
-          if (!VMap[SomeBlock])
-            S->setSuccessor(i, End);
-        }
-      }
-      RemapInstruction(&II, VMap, RemapFlag);
-    }
+    for (Instruction &II : BB)
+      RemapInstruction(&II, VMap);
+  }
 }
 
 // This function uses code of Utils/CloneModule.cpp
-std::unique_ptr<Module> NewMakeLoopOnlyModule(Function *F, Loop *L,
-                                              std::string NewFuncName) {
-
+// We do not clone any definitions but declarations only.
+static std::unique_ptr<Module>
+newMakeLoopOnlyModule(Function *F, Loop *L, const StringRef NewFuncName) {
   ValueToValueMapTy VMap;
   Module *M = F->getParent();
-  // FIXME: Not entirely sure whether this should be true or false.
-  //        If false is correct, that would save us some lines of code.
+
   // First off, we need to create the new module.
   std::unique_ptr<Module> New =
       std::make_unique<Module>(M->getModuleIdentifier(), M->getContext());
@@ -443,17 +338,21 @@ std::unique_ptr<Module> NewMakeLoopOnlyModule(Function *F, Loop *L,
   // new module.  Here we add them to the VMap and to the new Module.  We
   // don't worry about attributes or initializers, they will come later.
   //
-  for (Module::const_global_iterator I = M->global_begin(), E = M->global_end();
-       I != E; ++I) { // TODO: Only copy globals used in loop
+  for (const GlobalVariable &I : M->globals()) {
+    // TODO: Only copy globals used in loop
     GlobalVariable *GV = new GlobalVariable(
-        *New, I->getValueType(), I->isConstant(), I->getLinkage(),
-        (Constant *)nullptr, I->getName(), (GlobalVariable *)nullptr,
-        I->getThreadLocalMode(), I->getType()->getAddressSpace());
-    GV->copyAttributesFrom(&*I);
-    VMap[&*I] = GV;
+        *New, I.getValueType(), I.isConstant(), I.getLinkage(),
+        (Constant *)nullptr, I.getName(), (GlobalVariable *)nullptr,
+        I.getThreadLocalMode(), I.getType()->getAddressSpace());
+    GV->copyAttributesFrom(&I);
+    VMap[&I] = GV;
   }
 
   // Loop over the functions in the module, making external functions as before
+  //
+  // TODO: when using the benchmarking mode, we would either have to copy
+  // function definitions or refrain from analyzing loops with call instructions
+  // (at least non-intrinsic ones).
   for (const Function &I : M->functions()) {
     Function *NF = Function::Create(cast<FunctionType>(I.getValueType()),
                                     I.getLinkage(), I.getName(), New.get());
@@ -462,23 +361,22 @@ std::unique_ptr<Module> NewMakeLoopOnlyModule(Function *F, Loop *L,
   }
 
   // Loop over the aliases in the module
-  for (Module::const_alias_iterator I = M->alias_begin(), E = M->alias_end();
-       I != E; ++I) {
+  for (const GlobalAlias &I : M->aliases()) {
     // An alias cannot act as an external reference, so we need to create
     // either a function or a global variable depending on the value type.
     // FIXME: Once pointee types are gone we can probably pick one or the
     // other.
     GlobalValue *GV;
-    if (I->getValueType()->isFunctionTy())
-      GV = Function::Create(cast<FunctionType>(I->getValueType()),
-                            GlobalValue::ExternalLinkage, I->getAddressSpace(),
-                            I->getName(), New.get());
+    if (I.getValueType()->isFunctionTy())
+      GV = Function::Create(cast<FunctionType>(I.getValueType()),
+                            GlobalValue::ExternalLinkage, I.getAddressSpace(),
+                            I.getName(), New.get());
     else
-      GV = new GlobalVariable(*New, I->getValueType(), false,
+      GV = new GlobalVariable(*New, I.getValueType(), false,
                               GlobalValue::ExternalLinkage, nullptr,
-                              I->getName(), nullptr, I->getThreadLocalMode(),
-                              I->getType()->getAddressSpace());
-    VMap[&*I] = GV;
+                              I.getName(), nullptr, I.getThreadLocalMode(),
+                              I.getType()->getAddressSpace());
+    VMap[&I] = GV;
     // We do not copy attributes (mainly because copying between different
     // kinds of globals is forbidden), but this is generally not required for
     // correctness.
@@ -504,16 +402,13 @@ std::unique_ptr<Module> NewMakeLoopOnlyModule(Function *F, Loop *L,
   }
 
   // Here the original clones functions, we do it a little different
-  createNewLoopFunction(&New, F, L, VMap, NewFuncName);
+  createNewLoopFunction(New.get(), F, L, VMap, NewFuncName);
 
   // And named metadata....
-  for (Module::const_named_metadata_iterator I = M->named_metadata_begin(),
-                                             E = M->named_metadata_end();
-       I != E; ++I) {
-    const NamedMDNode &NMD = *I;
+  for (const NamedMDNode &NMD : M->named_metadata()) {
     NamedMDNode *NewNMD = New->getOrInsertNamedMetadata(NMD.getName());
-    for (unsigned i = 0, e = NMD.getNumOperands(); i != e; ++i)
-      NewNMD->addOperand(MapMetadata(NMD.getOperand(i), VMap));
+    for (const MDNode *Operand : NMD.operands())
+      NewNMD->addOperand(MapMetadata(Operand, VMap));
   }
 
   return New;
@@ -524,7 +419,7 @@ std::unique_ptr<Module> NewMakeLoopOnlyModule(Function *F, Loop *L,
 // https://stackoverflow.com/questions/478898/how-do-i-execute-a-command
 // -and-get-the-output-of-the-command-within-c-using-po
 static std::string exec(const char *Cmd) {
-  std::array<char, 128> Buffer;
+  std::array<char, 4096> Buffer;
   std::string Res;
   std::unique_ptr<FILE, decltype(&pclose)> Pipe(popen(Cmd, "r"), pclose);
   assert(Pipe &&
@@ -540,9 +435,9 @@ static std::string exec(const char *Cmd) {
 // (To be called from the pass that performs the exploration)
 // FIXME: This only works when the compilation is executed from within
 // the build folder of llvm-project
-static int performMCACostCalc(std::string FileName, std::string TargetCPU,
-                              std::string TargetTriple,
-                              raw_pwrite_stream *OutStream) {
+static unsigned performMCACostCalc(std::string FileName, std::string TargetCPU,
+                                   std::string TargetTriple,
+                                   raw_pwrite_stream *OutStream) {
   // Before running the analyser, reduce the code we look at to the actual
   // loop code. The script will try to find a vector loop first, but fall back
   // to the for/while loop if no vector loop is found
@@ -573,11 +468,10 @@ static int performMCACostCalc(std::string FileName, std::string TargetCPU,
   std::string Output = exec(CommandMCA.c_str());
 
   // Transform result to a number
-  int Result = std::atoi(Output.c_str());
+  unsigned Result = std::stoi(Output);
 
   // And last, remove the tmp file
-  std::string Remove = "rm " + FileName;
-  exec(Remove.c_str());
+  remove(FileName.c_str());
 
   return Result;
 }
@@ -720,7 +614,7 @@ PreservedAnalyses ExplorativeLVPass::run(Function &F,
     if (L->getBlocksSet().empty())
       continue;
 
-    int LowestCost = -1;
+    unsigned LowestCost = UINT_MAX;
     unsigned LowestCostVF = 1;
     unsigned LowestCostIF = 1;
     // Try out which VF works best for this loop
@@ -728,15 +622,15 @@ PreservedAnalyses ExplorativeLVPass::run(Function &F,
       for (unsigned IF = 1; IF <= 8; IF *= 2) {
 
         // Place the loop as a function in its own private module
-        std::string newFuncName = F.getName().str() + "_vf" +
-                                  std::to_string(VF) + "-if" +
-                                  std::to_string(IF);
+        const std::string NewFuncName = F.getName().str() + ".vf" +
+                                        std::to_string(VF) + ".if" +
+                                        std::to_string(IF);
         // Force the loop to the given VF and IF (will be cloned together with
         // loop)
         addStringMetadataToLoop(L, "llvm.loop.vectorize.width", VF);
         addStringMetadataToLoop(L, "llvm.loop.interleave.count", IF);
         std::unique_ptr<Module> LoopModule =
-            NewMakeLoopOnlyModule(&F, L, newFuncName);
+            newMakeLoopOnlyModule(&F, L, NewFuncName);
 
         // This line "fixes" a bug where sometimes, starting the PM run will
         // trigger an invalid invalidation...
@@ -745,7 +639,7 @@ PreservedAnalyses ExplorativeLVPass::run(Function &F,
         // Run the middle end pipeline
         ExplorativeMPM.run(*LoopModule.get(), MAM);
 
-        int Result;
+        unsigned Result;
         // Expensive, but: If we are using llvm-mca for evaluation, we need
         // a new backend pipeline for each iteration as the print stream is
         // dead after one use
@@ -767,7 +661,7 @@ PreservedAnalyses ExplorativeLVPass::run(Function &F,
                                  TargetTriple.str(), OutStream);
 
         } else {
-          Function *LoopFunc = LoopModule->getFunction(newFuncName);
+          Function *LoopFunc = LoopModule->getFunction(NewFuncName);
           // Set MCInstCount to 1 to tell MCExplorer to only go for loops,
           // to anything else to have it count all MCInsts in function
           LoopFunc->getContext().setMCInstCount(ExplorePlain ? 0 : 1);
@@ -779,9 +673,15 @@ PreservedAnalyses ExplorativeLVPass::run(Function &F,
             LoopFunc->getContext().setScalarExploration(false);
           }
           NewCodeGenPasses.run(*LoopModule.get());
-          Result = LoopModule->getFunction(newFuncName)
+          Result = LoopModule->getFunction(NewFuncName)
                        ->getContext()
                        .getMCInstCount();
+        }
+
+        if (Result == UINT_MAX) {
+          LLVM_DEBUG(dbgs() << "\nExplorative LV: Invalid costs for VF " << VF
+                            << ", IF " << IF << "\n\n");
+          continue;
         }
 
         if (ExploreDivVF)
@@ -790,10 +690,8 @@ PreservedAnalyses ExplorativeLVPass::run(Function &F,
         LLVM_DEBUG(dbgs() << "\nExplorative LV: Received result " << Result
                           << " from cost module for VF " << VF << ", IF " << IF
                           << "\n\n");
-        if (Result == -1)
-          continue;
 
-        if (LowestCost == -1 || Result < LowestCost ||
+        if (Result < LowestCost ||
             (LowestCostVF != 1 && Result == LowestCost)) {
           // If costs are equal to costs retrieved before, always choose
           // the higher VF-IF combination unless best VF is scalar
