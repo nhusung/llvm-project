@@ -29,30 +29,44 @@
 namespace llvm {
 
 class ExplorativeLVPass : public PassInfoMixin<ExplorativeLVPass> {
+  struct OptPipelineContainer;
+  struct NullCGPipelineContainer;
+
+  // Things required to reconstruct the pipelines
+  TargetMachine *TM;
+  PipelineTuningOptions PTO;
+  Optional<PGOOptions> PGOOpt;
+
+  OptPipelineContainer *OptPipeline = nullptr;
+
+  // Code generation pipeline with no output
+  // This is used for instruction count mode.  Otherwise we need to rebuild
+  // the pipeline every time, since we cannot simply replace the output stream.
+  NullCGPipelineContainer *NullCGPipeline = nullptr;
+
+  bool processLoop(Function &F, Loop &L, TargetLibraryInfo &TLI);
 
 public:
   ExplorativeLVPass(TargetMachine *TM, PipelineTuningOptions PTO,
                     Optional<PGOOptions> PGOOpt)
       : TM(TM), PTO(PTO), PGOOpt(PGOOpt) {}
+  ExplorativeLVPass(ExplorativeLVPass &&Pass)
+      : TM(Pass.TM), PTO(Pass.PTO), PGOOpt(Pass.PGOOpt),
+        OptPipeline(Pass.OptPipeline), NullCGPipeline(Pass.NullCGPipeline) {
+    Pass.OptPipeline = nullptr;
+    Pass.NullCGPipeline = nullptr;
+  }
+  ExplorativeLVPass(const ExplorativeLVPass &Pass) = delete;
+  ~ExplorativeLVPass();
 
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
 
   static char ID; // Pass identification, replacement for typeid
 
   static StringRef name() { return "ExplorativeLV"; }
-
-private:
-  raw_pwrite_stream *init(legacy::PassManager &PM, int VecOps,
-                          std::string AssemblyFileName);
-
-  // FIXME: get an actual value from somewhere
-  bool DebugLogging = false;
-
-  // Things required to reconstruct the compilation pipeline
-  TargetMachine *TM;
-  PipelineTuningOptions PTO;
-  Optional<PGOOptions> PGOOpt;
 };
+
+enum class ExplorativeLVMetric { Disable, InstCount, MCA, Benchmark };
 
 } // namespace llvm
 

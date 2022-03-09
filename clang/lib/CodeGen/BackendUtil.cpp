@@ -98,7 +98,7 @@ using namespace llvm;
 
 namespace llvm {
 extern cl::opt<bool> DebugInfoCorrelate;
-extern cl::opt<bool> EnableExplorativeLV;
+extern cl::opt<ExplorativeLVMetric> ExplorativeLV;
 } // namespace llvm
 
 namespace {
@@ -1446,13 +1446,6 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
       MPM.addPass(createModuleToFunctionPassAdaptor(MemProfilerPass()));
       MPM.addPass(ModuleMemProfilerPass());
     }
-  }
-
-  if (EnableExplorativeLV) {
-    // All we have to do is to pass on the information about the
-    // vectorization library, then the exploration run can build
-    // its own backend pipeline
-    FAM.setCodeGenOpts((int)CodeGenOpts.getVecLib());
   }
 
   // Add a verifier pass if requested. We don't have to do this if the action

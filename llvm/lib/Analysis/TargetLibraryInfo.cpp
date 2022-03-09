@@ -1944,6 +1944,12 @@ TargetLibraryInfoWrapperPass::TargetLibraryInfoWrapperPass(
   initializeTargetLibraryInfoWrapperPassPass(*PassRegistry::getPassRegistry());
 }
 
+TargetLibraryInfoWrapperPass::TargetLibraryInfoWrapperPass(
+    const TargetLibraryInfo &TLI)
+    : ImmutablePass(ID), TLA(TLI) {
+  initializeTargetLibraryInfoWrapperPassPass(*PassRegistry::getPassRegistry());
+}
+
 AnalysisKey TargetLibraryAnalysis::Key;
 
 // Register the basic pass.

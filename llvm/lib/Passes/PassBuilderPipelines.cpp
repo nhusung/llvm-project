@@ -225,7 +225,7 @@ extern cl::opt<bool> EnableMatrix;
 extern cl::opt<bool> DisablePreInliner;
 extern cl::opt<int> PreInlineThreshold;
 
-extern cl::opt<bool> EnableExplorativeLV;
+extern cl::opt<ExplorativeLVMetric> ExplorativeLV;
 } // namespace llvm
 
 void PassBuilder::invokePeepholeEPCallbacks(FunctionPassManager &FPM,
@@ -994,9 +994,9 @@ void PassBuilder::addVectorPasses(OptimizationLevel Level,
                                   FunctionPassManager &FPM, bool IsFullLTO) {
   // Run the exploration pass to determine the best vectorization and
   // interleaving factor to use
-  if (EnableExplorativeLV) 
+  if (ExplorativeLV != ExplorativeLVMetric::Disable)
     FPM.addPass(ExplorativeLVPass(TM, PTO, PGOOpt));
-  
+
   FPM.addPass(LoopVectorizePass(
       LoopVectorizeOptions(!PTO.LoopInterleaving, !PTO.LoopVectorization)));
 
@@ -1664,7 +1664,6 @@ PassBuilder::buildLTODefaultPipeline(OptimizationLevel Level,
   MainFPM.addPass(DSEPass());
   MainFPM.addPass(MergedLoadStoreMotionPass());
 
-
   if (EnableConstraintElimination)
     MainFPM.addPass(ConstraintEliminationPass());
 
@@ -1689,8 +1688,7 @@ PassBuilder::buildLTODefaultPipeline(OptimizationLevel Level,
   addVectorPasses(Level, MainFPM, /* IsFullLTO */ true);
 
   // Run the OpenMPOpt CGSCC pass again late.
-  MPM.addPass(
-      createModuleToPostOrderCGSCCPassAdaptor(OpenMPOptCGSCCPass()));
+  MPM.addPass(createModuleToPostOrderCGSCCPassAdaptor(OpenMPOptCGSCCPass()));
 
   invokePeepholeEPCallbacks(MainFPM, Level);
   MainFPM.addPass(JumpThreadingPass(/*InsertFreezeWhenUnfoldingSelect*/ true));

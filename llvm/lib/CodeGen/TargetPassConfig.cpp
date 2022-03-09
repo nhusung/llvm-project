@@ -48,6 +48,7 @@
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Utils.h"
 #include "llvm/Transforms/Utils/SymbolRewriter.h"
+#include "llvm/Transforms/Vectorize/ExplorativeLV.h"
 #include <cassert>
 #include <string>
 
@@ -219,8 +220,7 @@ static cl::opt<CFLAAType> UseCFLAA(
 
 namespace llvm {
 // Whether to enable the MachineCodeExplorer for explorative vectorization
-extern cl::opt<bool> EnableExplorativeLV;
-extern cl::opt<bool> ExplorativeLVmca;
+extern cl::opt<ExplorativeLVMetric> ExplorativeLV;
 } // namespace llvm
 
 /// Option names for limiting the codegen pipeline.
@@ -1278,7 +1278,7 @@ void TargetPassConfig::addMachinePasses() {
 
   // Add MachineCodeExplorer pass if we perform explorative vectorization and do
   // not use another metric
-  if (EnableExplorativeLV && !ExplorativeLVmca) {
+  if (ExplorativeLV == ExplorativeLVMetric::InstCount) {
     // TODO: It would be more elegant to check that we are in the loop
     // compilation pipeline but not in the main pipeline.
     addPass(createMachineCodeExplorer());

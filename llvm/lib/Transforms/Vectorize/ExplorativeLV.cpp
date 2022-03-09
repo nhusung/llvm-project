@@ -28,23 +28,33 @@
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/IR/DebugInfo.h"
 #include "llvm/Passes/StandardInstrumentations.h"
+#include "llvm/Support/Debug.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/FileUtilities.h"
+#include "llvm/Support/JSON.h"
+#include "llvm/Support/Path.h"
+#include "llvm/Support/Program.h"
 #include "llvm/Transforms/ObjCARC.h"
 #include "llvm/Transforms/Utils/Cloning.h"
+#include <cstdint>
 
 using namespace llvm;
 #define DEBUG_TYPE "explorative-lv"
 
 namespace llvm {
 
-cl::opt<bool> EnableExplorativeLV(
-    "enable-explorative-lv", cl::Hidden, cl::init(false),
-    cl::desc("Enable loop vectorization by exploratively determining the VF"));
-
-// Set to true to use llvm-mca for machine code evaluation, to false to use
-// the resulting code's size (default: code size)
-cl::opt<bool> ExplorativeLVmca(
-    "explore-with-mca", cl::Hidden, cl::init(false),
-    cl::desc("Use llvm-mca for machine code evaluation in loop exploration"));
+cl::opt<ExplorativeLVMetric> ExplorativeLV(
+    "explorative-lv", cl::Hidden,
+    cl::desc(
+        "Which metric to use for machine code evaluation in loop exploration"),
+    cl::init(ExplorativeLVMetric::Disable),
+    cl::values(clEnumValN(ExplorativeLVMetric::Disable, "disable",
+                          "Disable explorative loop vectorization"),
+               clEnumValN(ExplorativeLVMetric::InstCount, "inst-count",
+                          "Count instructions"),
+               clEnumValN(ExplorativeLVMetric::MCA, "mca", "Use llvm-mca"),
+               clEnumValN(ExplorativeLVMetric::Benchmark, "benchmark",
+                          "Benchmark")));
 
 } // namespace llvm
 
@@ -58,25 +68,6 @@ static cl::opt<bool>
                  cl::desc("If loop exploration is enabled, aggregate "
                           "the cost results by the VF"));
 
-// Function copied and reduced from LoopVectorize.cpp
-static void collectSupportedLoops(Loop &L, LoopInfo *LI,
-                                  SmallVectorImpl<Loop *> &V) {
-  // Collect inner loops and outer loops without irreducible control flow. For
-  // now, only collect outer loops that have explicit vectorization hints. If we
-  // are stress testing the VPlan H-CFG construction, we collect the outermost
-  // loop of every loop nest.
-  if (L.isInnermost()) {
-    LoopBlocksRPO RPOT(&L);
-    RPOT.perform(LI);
-    if (!containsIrreducibleCFG<const BasicBlock *>(RPOT, *LI)) {
-      V.push_back(&L);
-      return;
-    }
-  }
-  for (Loop *InnerL : L)
-    collectSupportedLoops(*InnerL, LI, V);
-}
-
 // Function from CodeExtractor.cpp:
 /// definedInRegion - Return true if the specified value is defined in the
 /// extracted region.
@@ -88,63 +79,214 @@ definedInRegion(const llvm::SmallPtrSetImpl<const llvm::BasicBlock *> &Blocks,
   return false;
 }
 
-// This function uses a lot of code (and comments) from Utils/CloneFunction.cpp,
-// but also from IPO/LoopExtractor.cpp resp. Utils/CodeExtractor.cpp
-static void createNewLoopFunction(Module *M, const Function *OldFunc, Loop *L,
-                                  ValueToValueMapTy &VMap,
-                                  const StringRef NewFuncName) {
+// Function from CloneModule.cpp
+static void copyComdat(GlobalObject *Dst, const GlobalObject *Src) {
+  const Comdat *SC = Src->getComdat();
+  if (!SC)
+    return;
+  Comdat *DC = Dst->getParent()->getOrInsertComdat(SC->getName());
+  DC->setSelectionKind(SC->getSelectionKind());
+  Dst->setComdat(DC);
+}
+namespace {
+
+class ExplorativeLVCtx {
+  const Function &OrigFunc;
+  Loop &L;
+
+  Module *M;
+  ValueToValueMapTy VMap;
+  SmallVector<Value *> Inputs;
+  SmallVector<Instruction *> Outputs;
+  FunctionType *FuncTy;
+  SmallVector<Function *> LoopFuncs;
+
+  void cloneModuleDeclarations(bool CloneDefinitions);
+  void determineIO();
+
+public:
+  ExplorativeLVCtx(const Function &OrigFunc, Loop &L,
+                   bool CloneDefinitions = false);
+  ~ExplorativeLVCtx() { delete M; }
+
+  Module &getModule() { return *M; }
+
+  void buildMainFunctionBody();
+
+  Function *buildLoopFunction(unsigned VF, unsigned IF);
+  void clearLoopFuncs() {
+    for (Function *LoopFunc : LoopFuncs) {
+      LoopFunc->eraseFromParent();
+    }
+    LoopFuncs.clear();
+  }
+};
+
+// This method uses code of Utils/CloneModule.cpp
+// We do not clone any definitions but declarations only.
+void ExplorativeLVCtx::cloneModuleDeclarations(bool CloneDefinitions) {
+  const Module *OrigM = OrigFunc.getParent();
+
+  // First off, we need to create the new module.
+  M = new Module(OrigM->getModuleIdentifier(), OrigM->getContext());
+  M->setSourceFileName(OrigM->getSourceFileName());
+  M->setDataLayout(OrigM->getDataLayout());
+  M->setTargetTriple(OrigM->getTargetTriple());
+  M->setModuleInlineAsm(OrigM->getModuleInlineAsm());
+
+  // Loop over all of the global variables, making corresponding globals in the
+  // new module.  Here we add them to the VMap and to the new Module.  We
+  // don't worry about attributes or initializers, they will come later.
+  //
+  for (const GlobalVariable &I : OrigM->globals()) {
+    // TODO: Only copy globals used in loop?
+    GlobalVariable *GV = new GlobalVariable(
+        *M, I.getValueType(), I.isConstant(), I.getLinkage(),
+        (Constant *)nullptr, I.getName(), (GlobalVariable *)nullptr,
+        I.getThreadLocalMode(), I.getType()->getAddressSpace());
+    GV->copyAttributesFrom(&I);
+    VMap[&I] = GV;
+  }
+
+  // Loop over the functions in the module, making external functions as before
+  //
+  // TODO: when using the benchmarking mode, we would either have to copy
+  // function definitions or refrain from analyzing loops with call instructions
+  // (at least non-intrinsic ones).
+  for (const Function &I : OrigM->functions()) {
+    Function *NF = Function::Create(cast<FunctionType>(I.getValueType()),
+                                    I.getLinkage(), I.getName(), M);
+    NF->copyAttributesFrom(&I);
+    VMap[&I] = NF;
+  }
+
+  // Loop over the aliases in the module
+  for (const GlobalAlias &I : OrigM->aliases()) {
+    // An alias cannot act as an external reference, so we need to create
+    // either a function or a global variable depending on the value type.
+    // FIXME: Once pointee types are gone we can probably pick one or the
+    // other.
+    GlobalValue *GV;
+    if (I.getValueType()->isFunctionTy())
+      GV = Function::Create(cast<FunctionType>(I.getValueType()),
+                            GlobalValue::ExternalLinkage, I.getAddressSpace(),
+                            I.getName(), M);
+    else
+      GV = new GlobalVariable(*M, I.getValueType(), false,
+                              GlobalValue::ExternalLinkage, nullptr,
+                              I.getName(), nullptr, I.getThreadLocalMode(),
+                              I.getType()->getAddressSpace());
+    VMap[&I] = GV;
+    // We do not copy attributes (mainly because copying between different
+    // kinds of globals is forbidden), but this is generally not required for
+    // correctness.
+  }
+
+  // Now that all of the things that global variable initializer can refer to
+  // have been created, loop through and copy the global variable referrers
+  // over...  We also set the attributes on the global now.
+  //
+  for (const GlobalVariable &G : OrigM->globals()) {
+    GlobalVariable *GV = cast<GlobalVariable>(VMap[&G]);
+
+    SmallVector<std::pair<unsigned, MDNode *>, 1> MDs;
+    G.getAllMetadata(MDs);
+    for (auto MD : MDs)
+      GV->addMetadata(MD.first, *MapMetadata(MD.second, VMap));
+
+    if (G.isDeclaration())
+      continue;
+
+    if (!CloneDefinitions) {
+      // Skip after setting the correct linkage for an external reference.
+      GV->setLinkage(GlobalValue::ExternalLinkage);
+      continue;
+    }
+    if (G.hasInitializer())
+      GV->setInitializer(MapValue(G.getInitializer(), VMap));
+
+    copyComdat(GV, &G);
+  }
+
+  // And named metadata....
+  for (const NamedMDNode &NMD : OrigM->named_metadata()) {
+    NamedMDNode *NewNMD = M->getOrInsertNamedMetadata(NMD.getName());
+    for (const MDNode *Operand : NMD.operands())
+      NewNMD->addOperand(MapMetadata(Operand, VMap));
+  }
+}
+
+void ExplorativeLVCtx::determineIO() {
   // The core idea is to generate a function containing the basic blocks of the
   // loop.  Values used inside the loop and defined outside are parameters to
   // the function.  For each values defined inside the loop and used outside we
   // generate an output parameter to produce an observable side-effect such that
   // the code is not optimized away.
 
-  SmallVector<Value *> ArgVMap;
   SmallPtrSet<Value *, 32> ArgSet;
-  SmallVector<Instruction *> Outputs;
 
-  for (BasicBlock *BB : L->getBlocks()) {
+  for (BasicBlock *BB : L.getBlocks()) {
     for (Instruction &I : *BB) {
       // Used inside loop and defined outside?
       for (Value *Op : I.operand_values()) {
         Instruction *OpInst = dyn_cast<Instruction>(Op);
         if (OpInst) {
-          if (L->getBlocksSet().contains(OpInst->getParent()))
+          if (L.getBlocksSet().contains(OpInst->getParent()))
             continue;
         } else if (!isa<Argument>(Op) || ArgSet.contains(Op)) {
           continue;
         }
         ArgSet.insert(Op);
-        ArgVMap.push_back(Op);
+        Inputs.push_back(Op);
       }
 
       // Defined inside loop and used outside?
       for (User *U : I.users())
-        if (!definedInRegion(L->getBlocksSet(), U)) {
+        if (!definedInRegion(L.getBlocksSet(), U)) {
           Outputs.push_back(&I);
           break;
         }
     }
   }
+}
 
-  SmallVector<Type *> ArgTys;
-  ArgTys.reserve(ArgVMap.size() + Outputs.size());
-  for (Value *V : ArgVMap)
-    ArgTys.push_back(V->getType());
+ExplorativeLVCtx::ExplorativeLVCtx(const Function &OrigFunc, Loop &L,
+                                   bool CloneDefinitions)
+    : OrigFunc(OrigFunc), L(L) {
+  cloneModuleDeclarations(CloneDefinitions);
+  determineIO();
+
+  // Build the loop function type
+  SmallVector<Type *> Params;
+  Params.reserve(Inputs.size() + Outputs.size());
+  for (Value *V : Inputs)
+    Params.push_back(V->getType());
   for (Instruction *I : Outputs)
-    ArgTys.push_back(PointerType::getUnqual(I->getType()));
+    Params.push_back(PointerType::getUnqual(I->getType()));
 
-  // This function returns void, no varargs
-  FunctionType *LoopFuncTy =
-      FunctionType::get(Type::getVoidTy(M->getContext()), ArgTys, false);
+  // Returns void, no varargs
+  FuncTy = FunctionType::get(Type::getVoidTy(M->getContext()), Params, false);
+}
 
-  Function *LoopFunc =
-      Function::Create(LoopFuncTy, GlobalValue::ExternalLinkage,
-                       OldFunc->getAddressSpace(), NewFuncName, M);
+// This method uses a lot of code (and comments) from Utils/CloneFunction.cpp,
+// but also from IPO/LoopExtractor.cpp resp. Utils/CodeExtractor.cpp
+Function *ExplorativeLVCtx::buildLoopFunction(unsigned VF, unsigned IF) {
+  // Note that we actually modify the original loop here.  According to the docs
+  // the metadata is attached to the branch instructions in the latches, so it
+  // might be a bit difficult to directly add the metadata to the new
+  // function.  Hence, we do it here.  Since we finally choose the values
+  // explicitly for the original loop, it does not matter much anyway.
+  llvm::addStringMetadataToLoop(&L, "llvm.loop.vectorize.width", VF);
+  llvm::addStringMetadataToLoop(&L, "llvm.loop.interleave.count", IF);
+
+  Function *LoopFunc = Function::Create(
+      FuncTy, GlobalValue::ExternalLinkage, OrigFunc.getAddressSpace(),
+      OrigFunc.getName() + "." + std::to_string(VF) + "." + std::to_string(IF),
+      M);
 
   /* Insert the generated function arguments into the VMap, add names */ {
     auto *ArgPtr = LoopFunc->arg_begin();
-    for (Value *OldV : ArgVMap) {
+    for (Value *OldV : Inputs) {
       VMap[OldV] = ArgPtr;
       VMap[ArgPtr] = ArgPtr;
       if (OldV->hasName())
@@ -169,10 +311,14 @@ static void createNewLoopFunction(Module *M, const Function *OldFunc, Loop *L,
   AttributeList LoopAttrs = LoopFunc->getAttributes();
   // We do not clone function attributes, since the original function might
   // fulfill properties that the new one does not.
+  // However, we add a NoInline attribute, otherwise a lot of code might be
+  // eliminated in benchmarking mode.
+  LoopAttrs =
+      LoopAttrs.addFnAttribute(LoopFunc->getContext(), Attribute::NoInline);
 
   SmallVector<AttributeSet, 4> LoopArgAttrs(LoopFunc->arg_size());
-  AttributeList OldAttrs = OldFunc->getAttributes();
-  for (const Argument &OldArg : OldFunc->args()) {
+  AttributeList OldAttrs = OrigFunc.getAttributes();
+  for (const Argument &OldArg : OrigFunc.args()) {
     if (VMap.count(&OldArg) == 0)
       continue;
     if (Argument *NewArg = dyn_cast<Argument>(VMap[&OldArg])) {
@@ -193,7 +339,7 @@ static void createNewLoopFunction(Module *M, const Function *OldFunc, Loop *L,
   // Loop over all of the basic blocks in the loop, cloning them as
   // appropriate.
   BasicBlock *NewLoopHeader = nullptr;
-  for (const BasicBlock *BB : L->getBlocks()) {
+  for (const BasicBlock *BB : L.getBlocks()) {
 
     // Create a new basic block and copy instructions into it!
     BasicBlock *NewBB =
@@ -220,7 +366,7 @@ static void createNewLoopFunction(Module *M, const Function *OldFunc, Loop *L,
     // implementation, which generates an invalid BlockAddress when
     // cloning a function.)
     if (BB->hasAddressTaken()) {
-      Constant *OldBBAddr = BlockAddress::get(const_cast<Function *>(OldFunc),
+      Constant *OldBBAddr = BlockAddress::get(const_cast<Function *>(&OrigFunc),
                                               const_cast<BasicBlock *>(BB));
       VMap[OldBBAddr] = BlockAddress::get(LoopFunc, NewBB);
     }
@@ -235,9 +381,9 @@ static void createNewLoopFunction(Module *M, const Function *OldFunc, Loop *L,
   // For each edge that exits the loop: create store block that stores all live
   // variables in the output parameters.
   Function::arg_iterator OutputArgsBegin = LoopFunc->arg_begin();
-  std::advance(OutputArgsBegin, ArgVMap.size());
-  for (BasicBlock *BB : L->blocks()) {
-    if (!L->isLoopExiting(BB))
+  std::advance(OutputArgsBegin, Inputs.size());
+  for (BasicBlock *BB : L.blocks()) {
+    if (!L.isLoopExiting(BB))
       continue;
 
     Instruction *Term = BB->getTerminator();
@@ -247,9 +393,9 @@ static void createNewLoopFunction(Module *M, const Function *OldFunc, Loop *L,
 
     for (unsigned Idx = 0, Num = Term->getNumSuccessors(); Idx < Num; ++Idx) {
       BasicBlock *SuccBB = Term->getSuccessor(Idx);
-      if (L->getBlocksSet().contains(SuccBB))
+      if (L.getBlocksSet().contains(SuccBB))
         continue; // Not an exiting edge
-      assert(SuccBB->getParent() == OldFunc);
+      assert(SuccBB->getParent() == &OrigFunc);
 
       BasicBlock *StoreBB = BasicBlock::Create(LoopFunc->getContext(),
                                                "store_block", LoopFunc, EndBB);
@@ -258,12 +404,12 @@ static void createNewLoopFunction(Module *M, const Function *OldFunc, Loop *L,
 
       Function::arg_iterator OutputArg = OutputArgsBegin;
       for (Instruction *I : Outputs) {
-        assert(I->getParent()->getParent() == OldFunc);
+        assert(I->getParent()->getParent() == &OrigFunc);
         for (User *U : I->users()) {
           Instruction *UI = dyn_cast<Instruction>(U);
           // A user might be in the new function as we have not remapped the
           // operands yet.  Just ignore these users.
-          if (!UI || UI->getFunction() != OldFunc ||
+          if (!UI || UI->getFunction() != &OrigFunc ||
               !isPotentiallyReachable(SuccBB, UI->getParent()))
             continue;
 
@@ -305,7 +451,7 @@ static void createNewLoopFunction(Module *M, const Function *OldFunc, Loop *L,
   // Subprograms/CUs/types that were already mapped to themselves won't be
   // duplicated.
   SmallVector<std::pair<unsigned, MDNode *>, 1> MDs;
-  OldFunc->getAllMetadata(MDs);
+  OrigFunc.getAllMetadata(MDs);
   for (auto MD : MDs) {
     LoopFunc->addMetadata(MD.first, *MapMetadata(MD.second, VMap));
   }
@@ -317,127 +463,105 @@ static void createNewLoopFunction(Module *M, const Function *OldFunc, Loop *L,
     for (Instruction &II : BB)
       RemapInstruction(&II, VMap);
   }
+
+  LoopFuncs.push_back(LoopFunc);
+  return LoopFunc;
 }
 
-// This function uses code of Utils/CloneModule.cpp
-// We do not clone any definitions but declarations only.
-static std::unique_ptr<Module>
-newMakeLoopOnlyModule(Function *F, Loop *L, const StringRef NewFuncName) {
-  ValueToValueMapTy VMap;
-  Module *M = F->getParent();
+void ExplorativeLVCtx::buildMainFunctionBody() {
+  LLVMContext &C = M->getContext();
 
-  // First off, we need to create the new module.
-  std::unique_ptr<Module> New =
-      std::make_unique<Module>(M->getModuleIdentifier(), M->getContext());
-  New->setSourceFileName(M->getSourceFileName());
-  New->setDataLayout(M->getDataLayout());
-  New->setTargetTriple(M->getTargetTriple());
-  New->setModuleInlineAsm(M->getModuleInlineAsm());
-
-  // Loop over all of the global variables, making corresponding globals in the
-  // new module.  Here we add them to the VMap and to the new Module.  We
-  // don't worry about attributes or initializers, they will come later.
-  //
-  for (const GlobalVariable &I : M->globals()) {
-    // TODO: Only copy globals used in loop
-    GlobalVariable *GV = new GlobalVariable(
-        *New, I.getValueType(), I.isConstant(), I.getLinkage(),
-        (Constant *)nullptr, I.getName(), (GlobalVariable *)nullptr,
-        I.getThreadLocalMode(), I.getType()->getAddressSpace());
-    GV->copyAttributesFrom(&I);
-    VMap[&I] = GV;
+  Function *MainFunc = M->getFunction("main");
+  if (!MainFunc) {
+    MainFunc = Function::Create(FunctionType::get(Type::getInt32Ty(C), false),
+                                GlobalValue::ExternalLinkage, "main", M);
   }
 
-  // Loop over the functions in the module, making external functions as before
-  //
-  // TODO: when using the benchmarking mode, we would either have to copy
-  // function definitions or refrain from analyzing loops with call instructions
-  // (at least non-intrinsic ones).
-  for (const Function &I : M->functions()) {
-    Function *NF = Function::Create(cast<FunctionType>(I.getValueType()),
-                                    I.getLinkage(), I.getName(), New.get());
-    NF->copyAttributesFrom(&I);
-    VMap[&I] = NF;
+  // TODO: what happens if this function is already declared?
+  // -> use M->getOrInsertFunction?
+  static_assert(sizeof(clock_t) == 8, "clock_t is assumed to be 64 bit");
+  FunctionType *ClockFuncTy = FunctionType::get(Type::getInt64Ty(C), false);
+  Function *ClockFunc =
+      Function::Create(ClockFuncTy, GlobalValue::ExternalLinkage,
+                       OrigFunc.getAddressSpace(), "clock", M);
+
+  FunctionType *PrintfFuncTy =
+      FunctionType::get(Type::getInt32Ty(C), {Type::getInt8PtrTy(C)}, true);
+  Function *PrintfFunc =
+      Function::Create(PrintfFuncTy, GlobalValue::ExternalLinkage,
+                       OrigFunc.getAddressSpace(), "printf", M);
+
+  assert(LoopFuncs.size() > 0 && "No loop functions generated yet");
+  FunctionType *LoopFuncTy = LoopFuncs[0]->getFunctionType();
+
+  BasicBlock *BB = BasicBlock::Create(C, "main", MainFunc);
+
+  SmallVector<Value *> Args;
+  /* Create arguments */ {
+    assert(Inputs.size() <= LoopFuncTy->getNumParams());
+
+    auto *It = LoopFuncTy->param_begin();
+    auto *OutputParamsBegin = It;
+    std::advance(OutputParamsBegin, Inputs.size());
+
+    // Create input arguments
+    for (; It != OutputParamsBegin; ++It) {
+      // FIXME: we should use more meaningful values
+      Args.push_back(Constant::getNullValue(*It));
+    }
+
+    // Alloc locations for output parameters
+    for (auto *End = LoopFuncTy->param_end(); It != End; ++It) {
+      Args.push_back(
+          new AllocaInst(cast<PointerType>(*It)->getPointerElementType(),
+                         MainFunc->getAddressSpace(), "outarg", BB));
+    }
   }
 
-  // Loop over the aliases in the module
-  for (const GlobalAlias &I : M->aliases()) {
-    // An alias cannot act as an external reference, so we need to create
-    // either a function or a global variable depending on the value type.
-    // FIXME: Once pointee types are gone we can probably pick one or the
-    // other.
-    GlobalValue *GV;
-    if (I.getValueType()->isFunctionTy())
-      GV = Function::Create(cast<FunctionType>(I.getValueType()),
-                            GlobalValue::ExternalLinkage, I.getAddressSpace(),
-                            I.getName(), New.get());
-    else
-      GV = new GlobalVariable(*New, I.getValueType(), false,
-                              GlobalValue::ExternalLinkage, nullptr,
-                              I.getName(), nullptr, I.getThreadLocalMode(),
-                              I.getType()->getAddressSpace());
-    VMap[&I] = GV;
-    // We do not copy attributes (mainly because copying between different
-    // kinds of globals is forbidden), but this is generally not required for
-    // correctness.
+  // Create format string
+  static_assert(sizeof(unsigned long long) == 8,
+                "unsigned long long is expected to be 64 bit");
+  Constant *FormatStr = ConstantDataArray::getString(C, "%llu\n\0", false);
+  GlobalVariable *FormatStrGV =
+      new GlobalVariable(*M, FormatStr->getType(), true,
+                         GlobalValue::InternalLinkage, FormatStr, "fstr");
+  Constant *I640 = Constant::getNullValue(Type::getInt64Ty(C));
+  Constant *FormatStrPtr = ConstantExpr::getInBoundsGetElementPtr(
+      FormatStrGV->getValueType(), FormatStrGV,
+      ArrayRef<Constant *>{I640, I640});
+
+  for (Function *LoopFunc : LoopFuncs) {
+    // One run that we do not count
+    CallInst::Create(LoopFuncTy, LoopFunc, Args, "", BB);
+
+    CallInst *TStart = CallInst::Create(ClockFuncTy, ClockFunc, "ts", BB);
+
+    // Call the function many times to get stable results (hopefully)
+    for (unsigned I = 0; I < 1024; ++I) // TODO: which N should we choose?
+      CallInst::Create(LoopFuncTy, LoopFunc, Args, "", BB);
+
+    CallInst *TEnd = CallInst::Create(ClockFuncTy, ClockFunc, "te", BB);
+    BinaryOperator *TDiff = BinaryOperator::CreateSub(TEnd, TStart, "dt", BB);
+    CallInst::Create(PrintfFuncTy, PrintfFunc, {FormatStrPtr, TDiff}, "", BB);
   }
 
-  // Now that all of the things that global variable initializer can refer to
-  // have been created, loop through and copy the global variable referrers
-  // over...  We also set the attributes on the global now.
-  //
-  for (const GlobalVariable &G : M->globals()) {
-    GlobalVariable *GV = cast<GlobalVariable>(VMap[&G]);
-
-    SmallVector<std::pair<unsigned, MDNode *>, 1> MDs;
-    G.getAllMetadata(MDs);
-    for (auto MD : MDs)
-      GV->addMetadata(MD.first, *MapMetadata(MD.second, VMap));
-
-    if (G.isDeclaration())
-      continue;
-
-    // Skip after setting the correct linkage for an external reference.
-    GV->setLinkage(GlobalValue::ExternalLinkage);
-  }
-
-  // Here the original clones functions, we do it a little different
-  createNewLoopFunction(New.get(), F, L, VMap, NewFuncName);
-
-  // And named metadata....
-  for (const NamedMDNode &NMD : M->named_metadata()) {
-    NamedMDNode *NewNMD = New->getOrInsertNamedMetadata(NMD.getName());
-    for (const MDNode *Operand : NMD.operands())
-      NewNMD->addOperand(MapMetadata(Operand, VMap));
-  }
-
-  return New;
+  ReturnInst::Create(C, Constant::getNullValue(MainFunc->getReturnType()), BB);
 }
 
-// Executes the command line and returns the total output it sees
-// Based on a Stackoverflow solution here:
-// https://stackoverflow.com/questions/478898/how-do-i-execute-a-command
-// -and-get-the-output-of-the-command-within-c-using-po
-static std::string exec(const char *Cmd) {
-  std::array<char, 4096> Buffer;
-  std::string Res;
-  std::unique_ptr<FILE, decltype(&pclose)> Pipe(popen(Cmd, "r"), pclose);
-  assert(Pipe &&
-         "MachineCodeExplorer cannot open a command line to execute llvm-mca");
-  while (fgets(Buffer.data(), Buffer.size(), Pipe.get()) != nullptr) {
-    Res += Buffer.data();
-  }
-  return Res;
+} // end anonymous namespace
+
+// From ClangLinkerWrapper
+static std::string getMainExecutable(const char *Name) {
+  void *Ptr = (void *)(intptr_t)&getMainExecutable;
+  auto COWPath = sys::fs::getMainExecutable(Name, Ptr);
+  return sys::path::parent_path(COWPath).str();
 }
 
 // The more complex approach, using the runtime estimation mechanisms
 // already present in LLVM: llvm-mca
 // (To be called from the pass that performs the exploration)
-// FIXME: This only works when the compilation is executed from within
-// the build folder of llvm-project
-static unsigned performMCACostCalc(std::string FileName, std::string TargetCPU,
-                                   std::string TargetTriple,
-                                   raw_pwrite_stream *OutStream) {
+static unsigned performMCACostCalc(StringRef FileName, StringRef TargetCPU,
+                                   StringRef TargetTriple) {
   // Before running the analyser, reduce the code we look at to the actual
   // loop code. The script will try to find a vector loop first, but fall back
   // to the for/while loop if no vector loop is found
@@ -449,219 +573,179 @@ static unsigned performMCACostCalc(std::string FileName, std::string TargetCPU,
   Command.append(" ");
   Command.append(ReducedFileName);*/
 
-  // Build the most specific command line we can generate from
-  // the info in TM
-  // First, let's wait for a second to make sure printing the file has finished
-  std::string CommandMCA = "bin/llvm-mca";
-  CommandMCA.append(" --mcpu=" + TargetCPU);
-  CommandMCA.append(" --mtriple=" + TargetTriple);
-  CommandMCA.append(" --instruction-info=false");
-  CommandMCA.append(" --resource-pressure=false ");
-  CommandMCA.append(FileName);
-  // Immediately reduce the output to the part we're interested in
-  CommandMCA.append(" | grep 'Total Cycles' | cut -f2- -d:");
+  // Find llvm-mca executable
+  // FIXME: do this only once
+  auto MCAExecPath =
+      sys::findProgramByName("llvm-mca", {getMainExecutable("llvm-mca")});
+  if (!MCAExecPath) {
+    errs() << "Explorative LV: Could not find llvm-mca executable\n";
+    return UINT_MAX;
+  }
 
-  // Retrieve result
-  /*Command.append(" && ");
-  Command.append(CommandMCA);
-  std::string Output = exec(Command.c_str());*/
-  std::string Output = exec(CommandMCA.c_str());
+  // Build the most specific command line we can generate from the info in TM
+  SmallString<32> MCAOutPath;
+  sys::fs::createTemporaryFile("llvm-mca-out", "json", MCAOutPath);
+  FileRemover MCAOutRemover(MCAOutPath);
+  if (sys::ExecuteAndWait(
+          MCAExecPath.get(),
+          {"llvm-mca", "--mcpu=" + TargetCPU.str(),
+           "--mtriple=" + TargetTriple.str(), "--instruction-info=false",
+           "--resource-pressure=false", "--json", FileName},
+          None, {StringRef(""), MCAOutPath.str(), StringRef("")}) != 0) {
+    errs() << "Explorative LV: executing llvm-mca failed";
+    return UINT_MAX;
+  }
 
-  // Transform result to a number
-  unsigned Result = std::stoi(Output);
+  // Read JSON
+  auto MCAOutBuf = MemoryBuffer::getFile(MCAOutPath);
+  if (!MCAOutBuf) {
+    errs() << "Explorative LV: could not read llvm-mca output\n";
+    return UINT_MAX;
+  }
+  StringRef MCAOut = MCAOutBuf.get()->getBuffer();
+  auto MCAJSON = json::parse(MCAOut);
+  if (!MCAJSON) {
+    errs() << "Explorative LV: could not parse llvm-mca JSON\n";
+    return UINT_MAX;
+  }
 
-  // And last, remove the tmp file
-  remove(FileName.c_str());
+  // Extract CodeRegions[0].SummaryView.TotalCycles from JSON
+  do {
+    json::Object *Root = MCAJSON.get().getAsObject();
+    if (!Root)
+      break;
+    json::Array *CodeRegions = Root->getArray("CodeRegions");
+    if (!CodeRegions || CodeRegions->size() == 0)
+      break;
+    json::Object *CodeRegion = (*CodeRegions)[0].getAsObject();
+    if (!CodeRegion)
+      break;
+    json::Object *SummaryView = CodeRegion->getObject("SummaryView");
+    if (!SummaryView)
+      break;
+    int64_t TotalCycles = SummaryView->getInteger("TotalCycles").getValueOr(-1);
+    if (TotalCycles >= 0)
+      return TotalCycles;
+  } while (false);
 
-  return Result;
+  errs() << "Explorative LV: llvm-mca output is malformed\n";
+  return UINT_MAX;
 }
 
 // Add to the given pass manager everything we need to simulate our backend
 // pipeline
-raw_pwrite_stream *ExplorativeLVPass::init(legacy::PassManager &PM, int VecOps,
-                                           std::string AssemblyFileName) {
-  /********** this is basically BackendUtil::createTLII **********/
+// ~~> EmitAssemblyHelper::AddEmitPasses in clang's BackendUtil
+static void initCodeGen(legacy::PassManager &PM, TargetMachine &TM,
+                        const TargetLibraryInfo &TLI, raw_pwrite_stream &OS,
+                        CodeGenFileType CGFT) {
   // Add LibraryInfo.
-  llvm::Triple TargetTriple(TM->getTargetTriple());
-  TargetLibraryInfoImpl *TLII = new TargetLibraryInfoImpl(TargetTriple);
-  switch (VecOps) {
-  case 1:
-    TLII->addVectorizableFunctionsFromVecLib(TargetLibraryInfoImpl::Accelerate);
-    break;
-  case 2:
-    switch (TargetTriple.getArch()) {
-    default:
-      break;
-    case llvm::Triple::x86_64:
-      TLII->addVectorizableFunctionsFromVecLib(
-          TargetLibraryInfoImpl::LIBMVEC_X86);
-      break;
-    }
-    break;
-  case 3:
-    TLII->addVectorizableFunctionsFromVecLib(TargetLibraryInfoImpl::MASSV);
-    break;
-  case 4:
-    TLII->addVectorizableFunctionsFromVecLib(TargetLibraryInfoImpl::SVML);
-    break;
-  default:
-    break;
-  }
-  /**************************************************/
-  // Now fill the pipeline.
-  std::error_code EC;
-  std::unique_ptr<TargetLibraryInfoImpl> TLIIptr(TLII);
-  PM.add(new TargetLibraryInfoWrapperPass(*TLIIptr));
+  PM.add(new TargetLibraryInfoWrapperPass(TLI));
+
+  // Add ObjC ARC final-cleanup optimizations. This is done as part of the
+  // "codegen" passes so that it isn't run multiple times when there is
+  // inlining happening.
   PM.add(createObjCARCContractPass());
 
-  raw_pwrite_stream *MyIntermediateOutput;
-  if (AssemblyFileName != "") {
-    MyIntermediateOutput = new raw_fd_ostream(AssemblyFileName, EC);
-    TM->addPassesToEmitFile(PM, *MyIntermediateOutput, nullptr,
-                            CGFT_AssemblyFile, false);
-  } else {
-    MyIntermediateOutput = new raw_fd_ostream("trash.tmp", EC);
-    TM->addPassesToEmitFile(PM, *MyIntermediateOutput, nullptr, CGFT_Null,
-                            false);
-  }
-  return MyIntermediateOutput;
+  TM.addPassesToEmitFile(PM, OS, nullptr, CGFT, /* DisableVerify */ false);
 }
 
-PreservedAnalyses ExplorativeLVPass::run(Function &F,
-                                         FunctionAnalysisManager &AM) {
-
-  int CodeGenOpts = AM.getCodeGenOpts();
-  // Don't do anything if we are not supposed to do anything, or if
-  // this is part of a running exploration
-  // (which is both true if the CodeGenOpts haven't been set)
-  if (CodeGenOpts == -1 || !EnableExplorativeLV)
-    return PreservedAnalyses::all();
-
-  auto &AC = AM.getResult<AssumptionAnalysis>(F);
-  auto &DT = AM.getResult<DominatorTreeAnalysis>(F);
-  auto &LI = AM.getResult<LoopAnalysis>(F);
-  auto &SE = AM.getResult<ScalarEvolutionAnalysis>(F);
-  Module *Original = F.getParent();
-
-  // Building our own pipeline
-
-  /******* Code from BackendUtil::RunOptimizationPipeline ******/
+struct ExplorativeLVPass::OptPipelineContainer {
   PassInstrumentationCallbacks PIC;
-  StandardInstrumentations SI(DebugLogging);
-  SI.registerCallbacks(PIC);
+  StandardInstrumentations SI;
 
-  // Create a new PassBuilder which is the basis of a pipeline
-  // TODO: I'm not 100% sure that it's wise to use the original TM here
-  PassBuilder NewPB(TM, PTO, PGOOpt, &PIC);
   LoopAnalysisManager LAM;
   FunctionAnalysisManager FAM;
   CGSCCAnalysisManager CGAM;
   ModuleAnalysisManager MAM;
-  // Register the AA manager first so that our version is the one used.
-  FAM.registerPass([&] { return NewPB.buildDefaultAAPipeline(); });
+  ModulePassManager MPM;
 
-  // Register the target library analysis directly and give it a customized
-  // preset TLI.
-  Triple TargetTriple(Original->getTargetTriple());
-  std::unique_ptr<TargetLibraryInfoImpl> TLII(
-      new TargetLibraryInfoImpl(TargetTriple));
-  FAM.registerPass([&] { return TargetLibraryAnalysis(*TLII); });
+  // Inspired by BackendUtil::RunCustomizationPipeline (clang)
+  // TODO: customization of SI using command line flags or clang's CodeGenOpts?
+  OptPipelineContainer(TargetMachine *TM, PipelineTuningOptions PTO,
+                       Optional<PGOOptions> PGOOpt,
+                       const TargetLibraryInfo &TLI)
+      : SI(/* DebugLogging */ false) {
+    SI.registerCallbacks(PIC, &FAM);
 
-  // Register all the basic analyses with the managers.
-  NewPB.registerModuleAnalyses(MAM);
-  NewPB.registerCGSCCAnalyses(CGAM);
-  NewPB.registerFunctionAnalyses(FAM);
-  NewPB.registerLoopAnalyses(LAM);
-  NewPB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+    // Create a new PassBuilder which is the basis of a pipeline
+    // TODO: I'm not 100% sure that it's wise to use the original TM here
+    PassBuilder PB(TM, PTO, PGOOpt, &PIC);
 
-  ModulePassManager ExplorativeMPM =
-      NewPB.buildPerModuleDefaultPipeline(OptimizationLevel::O3);
+    // Register the target library analysis directly and give it a customized
+    // preset TLI.
+    FAM.registerPass([&] { return TargetLibraryAnalysis(TLI); });
 
-  /**************************************************/
+    // Register all the basic analyses with the managers.
+    PB.registerModuleAnalyses(MAM);
+    PB.registerCGSCCAnalyses(CGAM);
+    PB.registerFunctionAnalyses(FAM);
+    PB.registerLoopAnalyses(LAM);
+    PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
 
-  legacy::PassManager NewCodeGenPasses;
-  // If this is a code size evaluation, we can re-use the same backend
-  // pipeline for each iteration.
-  if (!ExplorativeLVmca)
-    init(NewCodeGenPasses, CodeGenOpts, "");
+    MPM = PB.buildPerModuleDefaultPipeline(OptimizationLevel::O3);
+  }
 
-  /********* Code from LoopVectorize::runImpl *******/
+  void run(Module &M) {
+    // This line "fixes" a bug where sometimes, starting the PM run will
+    // trigger an invalid invalidation...
+    MAM.clear();
 
-  // The vectorizer requires loops to be in simplified form.
-  // Since simplification may add new inner loops, it has to run before the
-  // legality and profitability checks. This means running the loop vectorizer
-  // will simplify all loops, regardless of whether anything end up being
-  // vectorized.
-  for (auto &L : LI)
-    simplifyLoop(L, &DT, &LI, &SE, &AC, nullptr, false /* PreserveLCSSA */);
+    // Run the middle end pipeline
+    MPM.run(M, MAM);
+  }
+};
 
-  // Build up a worklist of inner-loops to vectorize.
-  SmallVector<Loop *, 8> Worklist;
+struct ExplorativeLVPass::NullCGPipelineContainer {
+  raw_null_ostream OS;
+  legacy::PassManager PM;
 
-  for (Loop *L : LI)
-    collectSupportedLoops(*L, &LI, Worklist);
+  NullCGPipelineContainer(TargetMachine &TM, const TargetLibraryInfo &TLI) {
+    initCodeGen(PM, TM, TLI, OS, CGFT_Null);
+  }
+};
 
-  /**************************************************/
+ExplorativeLVPass::~ExplorativeLVPass() {
+  delete NullCGPipeline;
+  delete OptPipeline;
+}
 
-  while (!Worklist.empty()) {
-    Loop *L = Worklist.pop_back_val();
-    if (findStringMetadataForLoop(L, "llvm.loop.vectorize.width")) {
-      LLVM_DEBUG(dbgs() << "Explorative LV: Loop already has user annotation, "
-                        << "skipping exploration\n\n");
-      continue;
-    }
+// returns whether an error occured
+bool ExplorativeLVPass::processLoop(Function &F, Loop &L,
+                                    TargetLibraryInfo &TLI) {
+  assert(OptPipeline && "OptPipeline not initialized");
 
-    if (L->getBlocksSet().empty())
-      continue;
+  ExplorativeLVCtx Ctx(F, L, ExplorativeLV == ExplorativeLVMetric::Benchmark);
 
+  unsigned LowestCostVF = 1;
+  unsigned LowestCostIF = 1;
+  if (ExplorativeLV != ExplorativeLVMetric::Benchmark) {
     unsigned LowestCost = UINT_MAX;
-    unsigned LowestCostVF = 1;
-    unsigned LowestCostIF = 1;
     // Try out which VF works best for this loop
     for (unsigned VF = 1; VF <= 16; VF *= 2) {
       for (unsigned IF = 1; IF <= 8; IF *= 2) {
-
-        // Place the loop as a function in its own private module
-        const std::string NewFuncName = F.getName().str() + ".vf" +
-                                        std::to_string(VF) + ".if" +
-                                        std::to_string(IF);
-        // Force the loop to the given VF and IF (will be cloned together with
-        // loop)
-        addStringMetadataToLoop(L, "llvm.loop.vectorize.width", VF);
-        addStringMetadataToLoop(L, "llvm.loop.interleave.count", IF);
-        std::unique_ptr<Module> LoopModule =
-            newMakeLoopOnlyModule(&F, L, NewFuncName);
-
-        // This line "fixes" a bug where sometimes, starting the PM run will
-        // trigger an invalid invalidation...
-        MAM.clear();
-
-        // Run the middle end pipeline
-        ExplorativeMPM.run(*LoopModule.get(), MAM);
+        Function *LoopFunc = Ctx.buildLoopFunction(VF, IF);
+        OptPipeline->run(Ctx.getModule());
 
         unsigned Result;
         // Expensive, but: If we are using llvm-mca for evaluation, we need
         // a new backend pipeline for each iteration as the print stream is
         // dead after one use
-        if (ExplorativeLVmca) {
-          std::string AssemblyFileName = "ExploredAssembly" +
-                                         std::to_string(VF) + "_" +
-                                         std::to_string(IF) + ".tmp";
-          raw_pwrite_stream *OutStream;
+        if (ExplorativeLV == ExplorativeLVMetric::MCA) {
+          int ASMFD;
+          SmallString<32> ASMPath;
+          sys::fs::createTemporaryFile("explorative-lv", "s", ASMFD, ASMPath);
+          FileRemover ASMRemover(ASMPath);
           {
-            legacy::PassManager FreshPipeline;
-            OutStream = init(FreshPipeline, CodeGenOpts, AssemblyFileName);
-            FreshPipeline.run(*LoopModule.get());
-            OutStream->flush();
+            raw_fd_ostream OS(ASMFD, true);
+            legacy::PassManager CGPipeline;
+            initCodeGen(CGPipeline, *TM, TLI, OS, CGFT_AssemblyFile);
+            CGPipeline.run(Ctx.getModule());
           }
           // Perform the cost calculation after the pipeline is deleted, to
           // make sure the assembly printer has finished
-          Result =
-              performMCACostCalc(AssemblyFileName, TM->getTargetCPU().str(),
-                                 TargetTriple.str(), OutStream);
-
+          Result = performMCACostCalc(ASMPath, TM->getTargetCPU(),
+                                      Ctx.getModule().getTargetTriple());
         } else {
-          Function *LoopFunc = LoopModule->getFunction(NewFuncName);
           // Set MCInstCount to 1 to tell MCExplorer to only go for loops,
           // to anything else to have it count all MCInsts in function
           LoopFunc->getContext().setMCInstCount(ExplorePlain ? 0 : 1);
@@ -672,24 +756,23 @@ PreservedAnalyses ExplorativeLVPass::run(Function &F,
           } else {
             LoopFunc->getContext().setScalarExploration(false);
           }
-          NewCodeGenPasses.run(*LoopModule.get());
-          Result = LoopModule->getFunction(NewFuncName)
-                       ->getContext()
-                       .getMCInstCount();
+          NullCGPipeline->PM.run(Ctx.getModule());
+          Result = LoopFunc->getContext().getMCInstCount();
         }
+        Ctx.clearLoopFuncs();
 
         if (Result == UINT_MAX) {
-          LLVM_DEBUG(dbgs() << "\nExplorative LV: Invalid costs for VF " << VF
-                            << ", IF " << IF << "\n\n");
+          LLVM_DEBUG(dbgs() << "Explorative LV: Invalid costs for VF " << VF
+                            << ", IF " << IF << "\n");
           continue;
         }
 
         if (ExploreDivVF)
           Result /= VF;
 
-        LLVM_DEBUG(dbgs() << "\nExplorative LV: Received result " << Result
+        LLVM_DEBUG(dbgs() << "Explorative LV: Received result " << Result
                           << " from cost module for VF " << VF << ", IF " << IF
-                          << "\n\n");
+                          << "\n");
 
         if (Result < LowestCost ||
             (LowestCostVF != 1 && Result == LowestCost)) {
@@ -701,14 +784,163 @@ PreservedAnalyses ExplorativeLVPass::run(Function &F,
         }
       }
     }
-    // Force the vectorizer to use the VF and IF that showed to have the lowest
-    // cost
-    LLVM_DEBUG(
-        dbgs() << "Explorative LV: Choosing this VF and IF for vectorization: "
-               << LowestCostVF << " and " << LowestCostIF << "\n\n");
-    addStringMetadataToLoop(L, "llvm.loop.vectorize.width", LowestCostVF);
-    addStringMetadataToLoop(L, "llvm.loop.interleave.count", LowestCostIF);
+  } else {
+    // Build a module containing functions for all VF/IF combinations
+    for (unsigned VF = 1; VF <= 16; VF *= 2) {
+      for (unsigned IF = 1; IF <= 8; IF *= 2)
+        Ctx.buildLoopFunction(VF, IF);
+    }
+
+    OptPipeline->run(Ctx.getModule());
+
+    // Build the main function -- no need to optimize it
+    Ctx.buildMainFunctionBody();
+
+    // Run code generation pipeline
+    SmallString<32> ObjectPath;
+    int ObjectFD;
+    sys::fs::createTemporaryFile("explorative-lv", "o", ObjectFD, ObjectPath);
+    FileRemover ObjectRemover(ObjectPath);
+    {
+      raw_fd_ostream OS(ObjectFD, true);
+      legacy::PassManager CGPipeline;
+      initCodeGen(CGPipeline, *TM, TLI, OS, CGFT_ObjectFile);
+      CGPipeline.run(Ctx.getModule());
+    }
+
+    // Create an executable
+    auto CCPath = sys::findProgramByName("cc"); // FIXME: do this only once
+    if (!CCPath) {
+      errs() << "Explorative LV: Could not find cc executable\n";
+      return true;
+    }
+    SmallString<32> ExecPath;
+    sys::fs::createTemporaryFile("explorative-lv", "", ExecPath);
+    FileRemover ExecRemover(ExecPath);
+    if (sys::ExecuteAndWait(CCPath.get(), {"cc", "-o", ExecPath, ObjectPath}) !=
+        0) {
+      errs() << "Explorative LV: Linking failed\n";
+      return true;
+    }
+
+    // Do the benchmarking
+    SmallString<32> BenchResPath;
+    sys::fs::createTemporaryFile("explorative-lv-out", "txt", BenchResPath);
+    FileRemover BenchResRemover(BenchResPath);
+    if (sys::ExecuteAndWait(
+            ExecPath, {"explorative-lv"}, None,
+            {StringRef(""), BenchResPath.str(), StringRef("")}) != 0) {
+      errs() << "Explorative LV: benchmarking failed\n";
+      return true;
+    }
+
+    auto BenchResBuf = MemoryBuffer::getFile(BenchResPath);
+    if (!BenchResBuf) {
+      errs() << "Explorative LV: could not load benchmarking results";
+      return true;
+    }
+    StringRef BenchRes = BenchResBuf.get()->getBuffer();
+
+    uint64_t LowestCost = UINT64_MAX;
+    for (unsigned VF = 1; VF <= 16; VF *= 2) {
+      for (unsigned IF = 1; IF <= 8; IF *= 2) {
+        uint64_t Result;
+        if (BenchRes.consumeInteger(10, Result)) {
+          errs() << "Explorative LV: could not read integer";
+          return true;
+        }
+        BenchRes = BenchRes.drop_front(); // drop '\n'
+
+        LLVM_DEBUG(dbgs() << "Explorative LV: costs for VF " << VF << ", IF "
+                          << IF << ": " << Result << "\n");
+        if (Result < LowestCost ||
+            (LowestCostVF != 1 && Result == LowestCost)) {
+          // If costs are equal to costs retrieved before, always choose
+          // the higher VF-IF combination unless best VF is scalar
+          LowestCost = Result;
+          LowestCostVF = VF;
+          LowestCostIF = IF;
+        }
+      }
+    }
   }
+
+  // Force the vectorizer to use the VF and IF that showed to have the lowest
+  // cost
+  LLVM_DEBUG(
+      dbgs() << "Explorative LV: Choosing this VF and IF for vectorization: "
+             << LowestCostVF << " and " << LowestCostIF << "\n\n");
+  addStringMetadataToLoop(&L, "llvm.loop.vectorize.width", LowestCostVF);
+  addStringMetadataToLoop(&L, "llvm.loop.interleave.count", LowestCostIF);
+
+  return false; // no errors
+}
+
+// Inspired by LoopVectorize.cpp
+static void collectSupportedLoops(Loop &L, LoopInfo *LI,
+                                  SmallVectorImpl<Loop *> &V) {
+  if (L.isInnermost()) {
+    if (L.getBlocks().empty())
+      return;
+
+    if (findStringMetadataForLoop(&L, "llvm.loop.vectorize.width")) {
+      LLVM_DEBUG(dbgs() << "Explorative LV: Loop already has user annotation, "
+                           "skipping exploration\n");
+      return;
+    }
+
+    LoopBlocksRPO RPOT(&L);
+    RPOT.perform(LI);
+    if (!containsIrreducibleCFG<const BasicBlock *>(RPOT, *LI)) {
+      V.push_back(&L);
+      return;
+    }
+  }
+  for (Loop *InnerL : L)
+    collectSupportedLoops(*InnerL, LI, V);
+}
+
+PreservedAnalyses ExplorativeLVPass::run(Function &F,
+                                         FunctionAnalysisManager &AM) {
+  auto &AC = AM.getResult<AssumptionAnalysis>(F);
+  auto &DT = AM.getResult<DominatorTreeAnalysis>(F);
+  auto &LI = AM.getResult<LoopAnalysis>(F);
+  auto &SE = AM.getResult<ScalarEvolutionAnalysis>(F);
+  auto &TLI = AM.getResult<TargetLibraryAnalysis>(F);
+
+  // ~~> LoopVectorize::runImpl
+
+  // The vectorizer requires loops to be in simplified form.
+  // Since simplification may add new inner loops, it has to run before the
+  // legality and profitability checks. This means running the loop vectorizer
+  // will simplify all loops, regardless of whether anything end up being
+  // vectorized.
+  for (auto &L : LI)
+    simplifyLoop(L, &DT, &LI, &SE, &AC, nullptr, false /* PreserveLCSSA */);
+
+  // Build up a worklist of inner-loops to vectorize.
+  SmallVector<Loop *, 8> Worklist;
+  for (Loop *L : LI) // outermost loops -> we need this recursive approach
+    collectSupportedLoops(*L, &LI, Worklist);
+  if (Worklist.empty())
+    return PreservedAnalyses::all();
+
+  // Initialize pipeline only if there is something to do.
+  if (!OptPipeline)
+    OptPipeline = new OptPipelineContainer(TM, PTO, PGOOpt, TLI);
+  // If this is a code size evaluation, we can re-use the same backend pipeline.
+  if (!NullCGPipeline && ExplorativeLV == ExplorativeLVMetric::InstCount)
+    NullCGPipeline = new NullCGPipelineContainer(*TM, TLI);
+
+  do {
+    Loop *L = Worklist.pop_back_val();
+    if (processLoop(F, *L, TLI)) {
+      LLVM_DEBUG(dbgs() << "Processing loop failed, letting the AutoVectorizer "
+                           "determine VF and IF\n");
+      addStringMetadataToLoop(L, "llvm.loop.vectorize.width", 0);
+      addStringMetadataToLoop(L, "llvm.loop.interleave.count", 0);
+    }
+  } while (!Worklist.empty());
 
   return PreservedAnalyses::all();
 }

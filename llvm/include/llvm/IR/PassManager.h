@@ -655,15 +655,7 @@ private:
       DenseMap<std::pair<AnalysisKey *, IRUnitT *>,
                typename AnalysisResultListT::iterator>;
 
-  // Transporting CodeGenOpts relevant for TLII creation as int
-  int CodeGenOpts = -1;
-
 public:
-  int getCodeGenOpts() { return CodeGenOpts; }
-
-  /// This information is required in the explorative LV pass
-  /// FIXME: Find a better way to get it there
-  void setCodeGenOpts(int CGO) { CodeGenOpts = CGO; }
 
   /// API to communicate dependencies between analyses during invalidation.
   ///
