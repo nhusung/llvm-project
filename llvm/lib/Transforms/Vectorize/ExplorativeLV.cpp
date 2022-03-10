@@ -21,12 +21,11 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Transforms/Vectorize/ExplorativeLV.h"
-#include "llvm/Analysis/AliasAnalysis.h"
-#include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/Analysis/CFG.h"
 #include "llvm/Analysis/LoopIterator.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/IR/DebugInfo.h"
+#include "llvm/IR/LegacyPassManager.h"
 #include "llvm/Passes/StandardInstrumentations.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/FileSystem.h"
@@ -36,7 +35,6 @@
 #include "llvm/Support/Program.h"
 #include "llvm/Transforms/ObjCARC.h"
 #include "llvm/Transforms/Utils/Cloning.h"
-#include <cstdint>
 
 using namespace llvm;
 #define DEBUG_TYPE "explorative-lv"

@@ -87,7 +87,6 @@
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 #include "llvm/Transforms/Utils/NameAnonGlobals.h"
 #include "llvm/Transforms/Utils/SymbolRewriter.h"
-#include "llvm/Transforms/Vectorize/ExplorativeLV.h"
 #include <memory>
 using namespace clang;
 using namespace llvm;
@@ -98,8 +97,7 @@ using namespace llvm;
 
 namespace llvm {
 extern cl::opt<bool> DebugInfoCorrelate;
-extern cl::opt<ExplorativeLVMetric> ExplorativeLV;
-} // namespace llvm
+}
 
 namespace {
 
@@ -148,7 +146,7 @@ class EmitAssemblyHelper {
   std::unique_ptr<llvm::ToolOutputFile> openOutputFile(StringRef Path) {
     std::error_code EC;
     auto F = std::make_unique<llvm::ToolOutputFile>(Path, EC,
-                                                    llvm::sys::fs::OF_None);
+                                                     llvm::sys::fs::OF_None);
     if (EC) {
       Diags.Report(diag::err_fe_unable_to_open_output) << Path << EC.message();
       F.reset();
@@ -210,22 +208,19 @@ private:
   const CodeGenOptions &CGOpts;
   const LangOptions &LangOpts;
 };
-} // namespace
+}
 
-static void addObjCARCAPElimPass(const PassManagerBuilder &Builder,
-                                 PassManagerBase &PM) {
+static void addObjCARCAPElimPass(const PassManagerBuilder &Builder, PassManagerBase &PM) {
   if (Builder.OptLevel > 0)
     PM.add(createObjCARCAPElimPass());
 }
 
-static void addObjCARCExpandPass(const PassManagerBuilder &Builder,
-                                 PassManagerBase &PM) {
+static void addObjCARCExpandPass(const PassManagerBuilder &Builder, PassManagerBase &PM) {
   if (Builder.OptLevel > 0)
     PM.add(createObjCARCExpandPass());
 }
 
-static void addObjCARCOptPass(const PassManagerBuilder &Builder,
-                              PassManagerBase &PM) {
+static void addObjCARCOptPass(const PassManagerBuilder &Builder, PassManagerBase &PM) {
   if (Builder.OptLevel > 0)
     PM.add(createObjCARCOptPass());
 }
@@ -307,7 +302,7 @@ static void addMemProfilerPasses(const PassManagerBuilder &Builder,
 static void addAddressSanitizerPasses(const PassManagerBuilder &Builder,
                                       legacy::PassManagerBase &PM) {
   const PassManagerBuilderWrapper &BuilderWrapper =
-      static_cast<const PassManagerBuilderWrapper &>(Builder);
+      static_cast<const PassManagerBuilderWrapper&>(Builder);
   const Triple &T = BuilderWrapper.getTargetTriple();
   const CodeGenOptions &CGOpts = BuilderWrapper.getCGOpts();
   bool Recover = CGOpts.SanitizeRecover.has(SanitizerKind::Address);
@@ -335,7 +330,7 @@ static void addKernelAddressSanitizerPasses(const PassManagerBuilder &Builder,
 }
 
 static void addHWAddressSanitizerPasses(const PassManagerBuilder &Builder,
-                                        legacy::PassManagerBase &PM) {
+                                            legacy::PassManagerBase &PM) {
   const PassManagerBuilderWrapper &BuilderWrapper =
       static_cast<const PassManagerBuilderWrapper &>(Builder);
   const CodeGenOptions &CGOpts = BuilderWrapper.getCGOpts();
@@ -359,7 +354,7 @@ static void addGeneralOptsForMemorySanitizer(const PassManagerBuilder &Builder,
                                              legacy::PassManagerBase &PM,
                                              bool CompileKernel) {
   const PassManagerBuilderWrapper &BuilderWrapper =
-      static_cast<const PassManagerBuilderWrapper &>(Builder);
+      static_cast<const PassManagerBuilderWrapper&>(Builder);
   const CodeGenOptions &CGOpts = BuilderWrapper.getCGOpts();
   int TrackOrigins = CGOpts.SanitizeMemoryTrackOrigins;
   bool Recover = CGOpts.SanitizeRecover.has(SanitizerKind::Memory);
@@ -398,7 +393,7 @@ static void addThreadSanitizerPass(const PassManagerBuilder &Builder,
 static void addDataFlowSanitizerPass(const PassManagerBuilder &Builder,
                                      legacy::PassManagerBase &PM) {
   const PassManagerBuilderWrapper &BuilderWrapper =
-      static_cast<const PassManagerBuilderWrapper &>(Builder);
+      static_cast<const PassManagerBuilderWrapper&>(Builder);
   const LangOptions &LangOpts = BuilderWrapper.getLangOpts();
   PM.add(createDataFlowSanitizerLegacyPassPass(LangOpts.NoSanitizeFiles));
 }
@@ -423,13 +418,13 @@ static TargetLibraryInfoImpl *createTLII(llvm::Triple &TargetTriple,
     TLII->addVectorizableFunctionsFromVecLib(TargetLibraryInfoImpl::Accelerate);
     break;
   case CodeGenOptions::LIBMVEC:
-    switch (TargetTriple.getArch()) {
-    default:
-      break;
-    case llvm::Triple::x86_64:
-      TLII->addVectorizableFunctionsFromVecLib(
-          TargetLibraryInfoImpl::LIBMVEC_X86);
-      break;
+    switch(TargetTriple.getArch()) {
+      default:
+        break;
+      case llvm::Triple::x86_64:
+        TLII->addVectorizableFunctionsFromVecLib
+                (TargetLibraryInfoImpl::LIBMVEC_X86);
+        break;
     }
     break;
   case CodeGenOptions::MASSV:
@@ -932,7 +927,8 @@ static void setCommandLineOpts(const CodeGenOptions &CodeGenOpts) {
   // FIXME: The command line parser below is not thread-safe and shares a global
   // state, so this call might crash or overwrite the options of another Clang
   // instance in the same process.
-  llvm::cl::ParseCommandLineOptions(BackendArgs.size() - 1, BackendArgs.data());
+  llvm::cl::ParseCommandLineOptions(BackendArgs.size() - 1,
+                                    BackendArgs.data());
 }
 
 void EmitAssemblyHelper::CreateTargetMachine(bool MustCreateTM) {
@@ -1054,7 +1050,8 @@ void EmitAssemblyHelper::EmitAssemblyWithLegacyPassManager(
       // Emit a module summary by default for Regular LTO except for ld64
       // targets
       bool EmitLTOSummary =
-          (CodeGenOpts.PrepareForLTO && !CodeGenOpts.DisableLLVMPasses &&
+          (CodeGenOpts.PrepareForLTO &&
+           !CodeGenOpts.DisableLLVMPasses &&
            llvm::Triple(TheModule->getTargetTriple()).getVendor() !=
                llvm::Triple::Apple);
       if (EmitLTOSummary) {
@@ -1360,11 +1357,12 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
     bool IsLTO = CodeGenOpts.PrepareForLTO;
 
     if (LangOpts.ObjCAutoRefCount) {
-      PB.registerPipelineStartEPCallback([](ModulePassManager &MPM,
-                                            OptimizationLevel Level) {
-        if (Level != OptimizationLevel::O0)
-          MPM.addPass(createModuleToFunctionPassAdaptor(ObjCARCExpandPass()));
-      });
+      PB.registerPipelineStartEPCallback(
+          [](ModulePassManager &MPM, OptimizationLevel Level) {
+            if (Level != OptimizationLevel::O0)
+              MPM.addPass(
+                  createModuleToFunctionPassAdaptor(ObjCARCExpandPass()));
+          });
       PB.registerPipelineEarlySimplificationEPCallback(
           [](ModulePassManager &MPM, OptimizationLevel Level) {
             if (Level != OptimizationLevel::O0)
@@ -1677,8 +1675,9 @@ void clang::EmitBackendOutput(DiagnosticsEngine &Diags,
                               const HeaderSearchOptions &HeaderOpts,
                               const CodeGenOptions &CGOpts,
                               const clang::TargetOptions &TOpts,
-                              const LangOptions &LOpts, StringRef TDesc,
-                              Module *M, BackendAction Action,
+                              const LangOptions &LOpts,
+                              StringRef TDesc, Module *M,
+                              BackendAction Action,
                               std::unique_ptr<raw_pwrite_stream> OS) {
 
   llvm::TimeTraceScope TimeScope("Backend");
@@ -1695,7 +1694,7 @@ void clang::EmitBackendOutput(DiagnosticsEngine &Diags,
                       .moveInto(CombinedIndex)) {
       logAllUnhandledErrors(std::move(E), errs(),
                             "Error loading index file '" +
-                                CGOpts.ThinLTOIndexFile + "': ");
+                            CGOpts.ThinLTOIndexFile + "': ");
       return;
     }
 

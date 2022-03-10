@@ -43,7 +43,6 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/TinyPtrVector.h"
 #include "llvm/IR/Function.h"
-#include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/PassInstrumentation.h"
 #include "llvm/IR/PassManagerInternal.h"
@@ -656,7 +655,6 @@ private:
                typename AnalysisResultListT::iterator>;
 
 public:
-
   /// API to communicate dependencies between analyses during invalidation.
   ///
   /// When an analysis result embeds handles to other analysis results, it
