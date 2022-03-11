@@ -33,6 +33,7 @@
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/LegacyPassManager.h"
+#include "llvm/IR/Value.h"
 #include "llvm/Passes/StandardInstrumentations.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/FileSystem.h"
@@ -304,7 +305,7 @@ Module *LoopModuleBuilder::getModule() {
   M->setTargetTriple(OrigM->getTargetTriple());
   if (!MakeExecutable) // Only copy inline ASM if we do not create an executable
     M->setModuleInlineAsm(OrigM->getModuleInlineAsm());
-  // Add named metadata
+  // Clone named metadata
   for (const NamedMDNode &NMD : OrigM->named_metadata()) {
     NamedMDNode *NewNMD = M->getOrInsertNamedMetadata(NMD.getName());
     for (const MDNode *Operand : NMD.operands())
@@ -332,6 +333,8 @@ Function *LoopModuleBuilder::buildLoopFunc(unsigned VF, unsigned IF) {
       OrigFunc.getName() + "." + std::to_string(VF) + "." + std::to_string(IF),
       M);
 
+  LLVMContext &C = LoopFunc->getContext();
+
   /* Insert the generated function arguments into the VMap, add names */ {
     auto *ArgPtr = LoopFunc->arg_begin();
     for (Value *OldV : Inputs) {
@@ -349,11 +352,13 @@ Function *LoopModuleBuilder::buildLoopFunc(unsigned VF, unsigned IF) {
     }
   }
 
-  // Introduce empty label at the beginning of the function, and at the
-  // end of the function, so we can refer to "before" and "after"
-  BasicBlock *BeginBB =
-      BasicBlock::Create(LoopFunc->getContext(), "loop_begin", LoopFunc);
+  BasicBlock *BeginBB = BasicBlock::Create(C, "loop_begin", LoopFunc);
+  BasicBlock *EndBB = BasicBlock::Create(C, "loop_end", LoopFunc);
+  ReturnInst *Ret = ReturnInst::Create(C, EndBB);
+
   VMap[BeginBB] = BeginBB;
+  VMap[EndBB] = EndBB;
+  VMap[Ret] = Ret;
 
   // Copy argument attributes (~~> CloneFunctionInto)
   AttributeList LoopAttrs = LoopFunc->getAttributes();
@@ -361,8 +366,7 @@ Function *LoopModuleBuilder::buildLoopFunc(unsigned VF, unsigned IF) {
   // fulfill properties that the new one does not.
   // However, we add a NoInline attribute, otherwise a lot of code might be
   // eliminated in benchmarking mode.
-  LoopAttrs =
-      LoopAttrs.addFnAttribute(LoopFunc->getContext(), Attribute::NoInline);
+  LoopAttrs = LoopAttrs.addFnAttribute(C, Attribute::NoInline);
 
   SmallVector<AttributeSet, 4> LoopArgAttrs(LoopFunc->arg_size());
   AttributeList OldAttrs = OrigFunc.getAttributes();
@@ -375,37 +379,50 @@ Function *LoopModuleBuilder::buildLoopFunc(unsigned VF, unsigned IF) {
     }
   }
 
-  LoopFunc->setAttributes(
-      AttributeList::get(LoopFunc->getContext(), LoopAttrs.getFnAttrs(),
-                         LoopAttrs.getRetAttrs(), LoopArgAttrs));
-
-  DebugInfoFinder DIFinder;
+  LoopFunc->setAttributes(AttributeList::get(
+      C, LoopAttrs.getFnAttrs(), LoopAttrs.getRetAttrs(), LoopArgAttrs));
 
   // From here on we need to deviate from CloneFunctionInto to only clone
   // the loop, not a whole function.
 
-  // Loop over all of the basic blocks in the loop, cloning them as
-  // appropriate.
-  BasicBlock *NewLoopHeader = nullptr;
-  for (const BasicBlock *BB : L.getBlocks()) {
+  // We'll need to iterate through the output parameters.  To ease this, create
+  // an iterator that we only have to copy.
+  Function::arg_iterator OutputArgsBegin = LoopFunc->arg_begin();
+  std::advance(OutputArgsBegin, Inputs.size());
 
-    // Create a new basic block and copy instructions into it!
-    BasicBlock *NewBB =
-        CloneBasicBlock(BB, VMap, ".l", LoopFunc, nullptr, &DIFinder);
-    if (!NewLoopHeader)
-      NewLoopHeader = NewBB;
+  // For performance reasons, we want as many fall-through branches as possible.
+  // Hence, we insert the blocks as follows:
+  //   1. loop_begin
+  //   2. cloned loop blocks
+  //   3. store blocks
+  //   4. loop_end
+  BasicBlock *LoopBBInsertBefore = EndBB;
+
+  // Loop over all of the basic blocks in the loop, cloning them as appropriate.
+  for (const BasicBlock *BB : L.getBlocks()) {
+    // Create a new basic block
+    BasicBlock *NewBB = BasicBlock::Create(C, "", LoopFunc, LoopBBInsertBefore);
+    if (BB->hasName())
+      NewBB->setName(BB->getName() + ".l");
 
     // Add basic block mapping.
     VMap[BB] = NewBB;
-    // And map block to itself because the remapping step
-    // will try to retrieve it
+    // And map block to itself as the remapping step will try to retrieve it.
     VMap[NewBB] = NewBB;
 
-    // Need to map each new instruction clone to itself, so VMap doesn't
-    // break when later stuff is looking at instructions we generated, not
-    // cloned
-    for (Instruction &I : *NewBB)
-      VMap[&I] = &I;
+    // Copy instructions
+    for (const Instruction &I : *BB) {
+      Instruction *NewInst = I.clone();
+      if (I.hasName())
+        NewInst->setName(I.getName());
+      NewBB->getInstList().push_back(NewInst);
+
+      VMap[&I] = NewInst;
+      // Need to map each new instruction clone to itself, so VMap doesn't
+      // break when later stuff is looking at instructions we generated, not
+      // cloned.
+      VMap[NewInst] = NewInst;
+    }
 
     // It is only legal to clone a function if a block address within that
     // function is never referenced outside of the function.  Given that, we
@@ -418,25 +435,13 @@ Function *LoopModuleBuilder::buildLoopFunc(unsigned VF, unsigned IF) {
                                               const_cast<BasicBlock *>(BB));
       VMap[OldBBAddr] = BlockAddress::get(LoopFunc, NewBB);
     }
-  }
 
-  BasicBlock *EndBB =
-      BasicBlock::Create(LoopFunc->getContext(), "loop_end", LoopFunc, nullptr);
-  ReturnInst *Ret = ReturnInst::Create(LoopFunc->getContext(), EndBB);
-  VMap[EndBB] = EndBB;
-  VMap[Ret] = Ret;
-
-  // For each edge that exits the loop: create store block that stores all live
-  // variables in the output parameters.
-  Function::arg_iterator OutputArgsBegin = LoopFunc->arg_begin();
-  std::advance(OutputArgsBegin, Inputs.size());
-  for (BasicBlock *BB : L.blocks()) {
+    // For each edge that exits the loop: create store block that stores all
+    // live variables in the output parameters.
     if (!L.isLoopExiting(BB))
       continue;
 
-    Instruction *Term = BB->getTerminator();
-    BasicBlock *NewBB = dyn_cast<BasicBlock>(VMap[BB]);
-    assert(NewBB && "block mapping missing");
+    const Instruction *Term = BB->getTerminator();
     Instruction *NewTerm = NewBB->getTerminator();
 
     for (unsigned Idx = 0, Num = Term->getNumSuccessors(); Idx < Num; ++Idx) {
@@ -445,8 +450,10 @@ Function *LoopModuleBuilder::buildLoopFunc(unsigned VF, unsigned IF) {
         continue; // Not an exiting edge
       assert(SuccBB->getParent() == &OrigFunc);
 
-      BasicBlock *StoreBB = BasicBlock::Create(LoopFunc->getContext(),
-                                               "store_block", LoopFunc, EndBB);
+      BasicBlock *StoreBB =
+          BasicBlock::Create(C, "store_block", LoopFunc, EndBB);
+      if (LoopBBInsertBefore == EndBB)
+        LoopBBInsertBefore = StoreBB;
       VMap[StoreBB] = StoreBB;
       NewTerm->setSuccessor(Idx, StoreBB);
 
@@ -465,7 +472,7 @@ Function *LoopModuleBuilder::buildLoopFunc(unsigned VF, unsigned IF) {
           PHINode *LCSSAPhi =
               PHINode::Create(UI->getType(), 1, "lcssa_phi", StoreBB);
           LCSSAPhi->addIncoming(VMap[I], NewBB);
-          StoreInst *Store = new llvm::StoreInst(LCSSAPhi, OutputArg, StoreBB);
+          StoreInst *Store = new StoreInst(LCSSAPhi, OutputArg, StoreBB);
           VMap[LCSSAPhi] = LCSSAPhi;
           VMap[Store] = Store;
 
@@ -479,6 +486,8 @@ Function *LoopModuleBuilder::buildLoopFunc(unsigned VF, unsigned IF) {
     }
   }
 
+  BasicBlock *NewLoopHeader =
+      LoopFunc->getBasicBlockList().getNextNode(*BeginBB);
   BranchInst *Branch = BranchInst::Create(NewLoopHeader, BeginBB);
   VMap[Branch] = Branch;
 
