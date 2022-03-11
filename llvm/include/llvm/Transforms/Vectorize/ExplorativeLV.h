@@ -64,9 +64,9 @@ public:
   static char ID; // Pass identification, replacement for typeid
 
   static StringRef name() { return "ExplorativeLV"; }
-};
 
-enum class ExplorativeLVMetric { Disable, InstCount, MCA, Benchmark };
+  enum class Metric { Disable, InstCount, MCA, Benchmark };
+};
 
 } // namespace llvm
 

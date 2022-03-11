@@ -25,6 +25,7 @@
 #include "llvm/Analysis/LoopIterator.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/IR/DebugInfo.h"
+#include "llvm/IR/IRPrintingPasses.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/Passes/StandardInstrumentations.h"
 #include "llvm/Support/Debug.h"
@@ -41,20 +42,30 @@ using namespace llvm;
 
 namespace llvm {
 
-cl::opt<ExplorativeLVMetric> ExplorativeLV(
+cl::opt<ExplorativeLVPass::Metric> ExplorativeLV(
     "explorative-lv", cl::Hidden,
     cl::desc(
         "Which metric to use for machine code evaluation in loop exploration"),
-    cl::init(ExplorativeLVMetric::Disable),
-    cl::values(clEnumValN(ExplorativeLVMetric::Disable, "disable",
+    cl::init(ExplorativeLVPass::Metric::Disable),
+    cl::values(clEnumValN(ExplorativeLVPass::Metric::Disable, "disable",
                           "Disable explorative loop vectorization"),
-               clEnumValN(ExplorativeLVMetric::InstCount, "inst-count",
+               clEnumValN(ExplorativeLVPass::Metric::InstCount, "inst-count",
                           "Count instructions"),
-               clEnumValN(ExplorativeLVMetric::MCA, "mca", "Use llvm-mca"),
-               clEnumValN(ExplorativeLVMetric::Benchmark, "benchmark",
+               clEnumValN(ExplorativeLVPass::Metric::MCA, "mca",
+                          "Use llvm-mca"),
+               clEnumValN(ExplorativeLVPass::Metric::Benchmark, "benchmark",
                           "Benchmark")));
 
 } // namespace llvm
+
+static cl::opt<unsigned>
+    ExploreMaxVF("explore-max-vf", cl::Hidden, cl::init(16),
+                 cl::desc("The maximum vectorization factor to use for "
+                          "explorative loop vectorization"));
+static cl::opt<unsigned>
+    ExploreMaxIF("explore-max-if", cl::Hidden, cl::init(8),
+                 cl::desc("The maximum interleaving factor to use for "
+                          "explorative loop vectorization"));
 
 static cl::opt<bool>
     ExplorePlain("explore-plain", cl::Hidden, cl::init(false),
@@ -65,6 +76,11 @@ static cl::opt<bool>
     ExploreDivVF("explore-divide-by-vf", cl::Hidden, cl::init(false),
                  cl::desc("If loop exploration is enabled, aggregate "
                           "the cost results by the VF"));
+
+static cl::opt<bool> ExploreDumpModuleIR(
+    "explore-dump-module-ir", cl::Hidden, cl::init(false),
+    cl::desc("If true, add a PrintModulePass at the beginning of the "
+             "explorative optimization pipeline"));
 
 // Function from CodeExtractor.cpp:
 /// definedInRegion - Return true if the specified value is defined in the
@@ -77,41 +93,39 @@ definedInRegion(const llvm::SmallPtrSetImpl<const llvm::BasicBlock *> &Blocks,
   return false;
 }
 
-// Function from CloneModule.cpp
-static void copyComdat(GlobalObject *Dst, const GlobalObject *Src) {
-  const Comdat *SC = Src->getComdat();
-  if (!SC)
-    return;
-  Comdat *DC = Dst->getParent()->getOrInsertComdat(SC->getName());
-  DC->setSelectionKind(SC->getSelectionKind());
-  Dst->setComdat(DC);
-}
 namespace {
 
-class ExplorativeLVCtx {
+class LoopModuleBuilder : public ValueMaterializer {
   const Function &OrigFunc;
   Loop &L;
 
-  Module *M;
+  Module *M = nullptr;
   ValueToValueMapTy VMap;
+  ValueMapper Mapper;
   SmallVector<Value *> Inputs;
   SmallVector<Instruction *> Outputs;
   FunctionType *FuncTy;
   SmallVector<Function *> LoopFuncs;
 
-  void cloneModuleDeclarations(bool CloneDefinitions);
-  void determineIO();
+  bool MakeExecutable;
+
+  bool determineIO();
+  void buildFuncTy();
 
 public:
-  ExplorativeLVCtx(const Function &OrigFunc, Loop &L,
-                   bool CloneDefinitions = false);
-  ~ExplorativeLVCtx() { delete M; }
+  LoopModuleBuilder(const Function &OrigFunc, Loop &L,
+                    bool MakeExecutable = false)
+      : OrigFunc(OrigFunc), L(L), Mapper(VMap, RF_None, nullptr, this),
+        MakeExecutable(MakeExecutable){};
+  virtual ~LoopModuleBuilder() { delete M; }
 
-  Module &getModule() { return *M; }
+  Value *materialize(Value *V) override;
 
-  void buildMainFunctionBody();
+  Module *getModule();
 
-  Function *buildLoopFunction(unsigned VF, unsigned IF);
+  void buildMainFuncBody();
+
+  Function *buildLoopFunc(unsigned VF, unsigned IF);
   void clearLoopFuncs() {
     for (Function *LoopFunc : LoopFuncs) {
       LoopFunc->eraseFromParent();
@@ -120,101 +134,7 @@ public:
   }
 };
 
-// This method uses code of Utils/CloneModule.cpp
-// We do not clone any definitions but declarations only.
-void ExplorativeLVCtx::cloneModuleDeclarations(bool CloneDefinitions) {
-  const Module *OrigM = OrigFunc.getParent();
-
-  // First off, we need to create the new module.
-  M = new Module(OrigM->getModuleIdentifier(), OrigM->getContext());
-  M->setSourceFileName(OrigM->getSourceFileName());
-  M->setDataLayout(OrigM->getDataLayout());
-  M->setTargetTriple(OrigM->getTargetTriple());
-  M->setModuleInlineAsm(OrigM->getModuleInlineAsm());
-
-  // Loop over all of the global variables, making corresponding globals in the
-  // new module.  Here we add them to the VMap and to the new Module.  We
-  // don't worry about attributes or initializers, they will come later.
-  //
-  for (const GlobalVariable &I : OrigM->globals()) {
-    // TODO: Only copy globals used in loop?
-    GlobalVariable *GV = new GlobalVariable(
-        *M, I.getValueType(), I.isConstant(), I.getLinkage(),
-        (Constant *)nullptr, I.getName(), (GlobalVariable *)nullptr,
-        I.getThreadLocalMode(), I.getType()->getAddressSpace());
-    GV->copyAttributesFrom(&I);
-    VMap[&I] = GV;
-  }
-
-  // Loop over the functions in the module, making external functions as before
-  //
-  // TODO: when using the benchmarking mode, we would either have to copy
-  // function definitions or refrain from analyzing loops with call instructions
-  // (at least non-intrinsic ones).
-  for (const Function &I : OrigM->functions()) {
-    Function *NF = Function::Create(cast<FunctionType>(I.getValueType()),
-                                    I.getLinkage(), I.getName(), M);
-    NF->copyAttributesFrom(&I);
-    VMap[&I] = NF;
-  }
-
-  // Loop over the aliases in the module
-  for (const GlobalAlias &I : OrigM->aliases()) {
-    // An alias cannot act as an external reference, so we need to create
-    // either a function or a global variable depending on the value type.
-    // FIXME: Once pointee types are gone we can probably pick one or the
-    // other.
-    GlobalValue *GV;
-    if (I.getValueType()->isFunctionTy())
-      GV = Function::Create(cast<FunctionType>(I.getValueType()),
-                            GlobalValue::ExternalLinkage, I.getAddressSpace(),
-                            I.getName(), M);
-    else
-      GV = new GlobalVariable(*M, I.getValueType(), false,
-                              GlobalValue::ExternalLinkage, nullptr,
-                              I.getName(), nullptr, I.getThreadLocalMode(),
-                              I.getType()->getAddressSpace());
-    VMap[&I] = GV;
-    // We do not copy attributes (mainly because copying between different
-    // kinds of globals is forbidden), but this is generally not required for
-    // correctness.
-  }
-
-  // Now that all of the things that global variable initializer can refer to
-  // have been created, loop through and copy the global variable referrers
-  // over...  We also set the attributes on the global now.
-  //
-  for (const GlobalVariable &G : OrigM->globals()) {
-    GlobalVariable *GV = cast<GlobalVariable>(VMap[&G]);
-
-    SmallVector<std::pair<unsigned, MDNode *>, 1> MDs;
-    G.getAllMetadata(MDs);
-    for (auto MD : MDs)
-      GV->addMetadata(MD.first, *MapMetadata(MD.second, VMap));
-
-    if (G.isDeclaration())
-      continue;
-
-    if (!CloneDefinitions) {
-      // Skip after setting the correct linkage for an external reference.
-      GV->setLinkage(GlobalValue::ExternalLinkage);
-      continue;
-    }
-    if (G.hasInitializer())
-      GV->setInitializer(MapValue(G.getInitializer(), VMap));
-
-    copyComdat(GV, &G);
-  }
-
-  // And named metadata....
-  for (const NamedMDNode &NMD : OrigM->named_metadata()) {
-    NamedMDNode *NewNMD = M->getOrInsertNamedMetadata(NMD.getName());
-    for (const MDNode *Operand : NMD.operands())
-      NewNMD->addOperand(MapMetadata(Operand, VMap));
-  }
-}
-
-void ExplorativeLVCtx::determineIO() {
+bool LoopModuleBuilder::determineIO() {
   // The core idea is to generate a function containing the basic blocks of the
   // loop.  Values used inside the loop and defined outside are parameters to
   // the function.  For each values defined inside the loop and used outside we
@@ -225,6 +145,19 @@ void ExplorativeLVCtx::determineIO() {
 
   for (BasicBlock *BB : L.getBlocks()) {
     for (Instruction &I : *BB) {
+      if (MakeExecutable && isa<CallBase>(I)) {
+        // Dealing with call instructions is hard.  If they have external
+        // linkage, the linker would probably fail.  One approach would be to
+        // replace them by dummy functions, but for now we refrain from
+        // analyzing these.  Inline assembly is also embedded using call
+        // instructions, we'd have to make these distinctions here.  However,
+        // we allow intrinsics.
+        if (!isa<IntrinsicInst>(I))
+          return false;
+
+        // TODO: are there intrinsics we should forbid?
+      }
+
       // Used inside loop and defined outside?
       for (Value *Op : I.operand_values()) {
         Instruction *OpInst = dyn_cast<Instruction>(Op);
@@ -246,15 +179,82 @@ void ExplorativeLVCtx::determineIO() {
         }
     }
   }
+
+  return true;
 }
 
-ExplorativeLVCtx::ExplorativeLVCtx(const Function &OrigFunc, Loop &L,
-                                   bool CloneDefinitions)
-    : OrigFunc(OrigFunc), L(L) {
-  cloneModuleDeclarations(CloneDefinitions);
-  determineIO();
+Value *LoopModuleBuilder::materialize(Value *V) {
+  // Special treatment for mapping global values: we need to copy them from the
+  // old module.  This code is inspired by CloneModule, however we use this
+  // ValueMaterializer to only clone globals as they are needed.  In case we
+  // want to create a signle executable for benchmarking, we can also make sure
+  // that there are no references to external symbols.
+  const GlobalValue *GVal = dyn_cast<GlobalValue>(V);
+  if (!GVal)
+    return nullptr;
 
-  // Build the loop function type
+  // The value should be in the original module
+  assert(GVal->getParent() == OrigFunc.getParent() &&
+         "Expected GVal to be in original module");
+
+  if (const GlobalVariable *GV = dyn_cast<GlobalVariable>(GVal)) {
+    GlobalVariable *NGV = new GlobalVariable(
+        *M, GV->getValueType(), GV->isConstant(), GV->getLinkage(), nullptr,
+        GV->getName() + ".l", nullptr, GV->getThreadLocalMode(),
+        GV->getAddressSpace());
+
+    NGV->copyAttributesFrom(GV);
+
+    SmallVector<std::pair<unsigned, MDNode *>, 1> MDs;
+    GV->getAllMetadata(MDs);
+    for (auto MD : MDs)
+      NGV->addMetadata(MD.first, *Mapper.mapMDNode(*MD.second));
+
+    if (!MakeExecutable)
+      return NGV;
+
+    if (!GV->hasInitializer()) {
+      NGV->setInitializer(Constant::getNullValue(GV->getValueType()));
+      return NGV;
+    }
+
+    // Not sure whether the initializer could refer to (the address of) GV ...
+    // To be on the safe side, we add the mapping now.
+    VMap[GV] = NGV;
+    NGV->setInitializer(Mapper.mapConstant(*GV->getInitializer()));
+
+    // Handling COMDATs is probably not needed ...
+
+    return NGV;
+  }
+
+  if (const Function *F = dyn_cast<Function>(GVal)) {
+    if (!MakeExecutable) {
+      Function *NF = Function::Create(cast<FunctionType>(F->getValueType()),
+                                      GlobalValue::ExternalLinkage,
+                                      F->getName() + ".l", M);
+      NF->copyAttributesFrom(F);
+      return NF;
+    }
+
+    return Constant::getNullValue(F->getType());
+  }
+
+  if (const GlobalAlias *GA = dyn_cast<GlobalAlias>(GVal)) {
+    // Replace alias by aliasee
+    const Constant *Aliasee = GA->getAliasee();
+    // FIXME: if the alias somehow pointed to itself, this would probably result
+    // in an infinite loop ...
+    return Aliasee ? Mapper.mapConstant(*Aliasee) : nullptr;
+  }
+
+  // TODO: IFuncs?
+
+  return nullptr;
+}
+
+// Builds the loop function type
+void LoopModuleBuilder::buildFuncTy() {
   SmallVector<Type *> Params;
   Params.reserve(Inputs.size() + Outputs.size());
   for (Value *V : Inputs)
@@ -266,9 +266,36 @@ ExplorativeLVCtx::ExplorativeLVCtx(const Function &OrigFunc, Loop &L,
   FuncTy = FunctionType::get(Type::getVoidTy(M->getContext()), Params, false);
 }
 
+Module *LoopModuleBuilder::getModule() {
+  if (M)
+    return M;
+
+  if (!determineIO())
+    return nullptr;
+
+  // Create the new module (~~> CloneModule)
+  const Module *OrigM = OrigFunc.getParent();
+  M = new Module(OrigM->getModuleIdentifier(), OrigM->getContext());
+  M->setSourceFileName(OrigM->getSourceFileName());
+  M->setDataLayout(OrigM->getDataLayout());
+  M->setTargetTriple(OrigM->getTargetTriple());
+  if (!MakeExecutable) // Only copy inline ASM if we do not create an executable
+    M->setModuleInlineAsm(OrigM->getModuleInlineAsm());
+  // Add named metadata
+  for (const NamedMDNode &NMD : OrigM->named_metadata()) {
+    NamedMDNode *NewNMD = M->getOrInsertNamedMetadata(NMD.getName());
+    for (const MDNode *Operand : NMD.operands())
+      NewNMD->addOperand(Mapper.mapMDNode(*Operand));
+  }
+
+  buildFuncTy();
+
+  return M;
+}
+
 // This method uses a lot of code (and comments) from Utils/CloneFunction.cpp,
 // but also from IPO/LoopExtractor.cpp resp. Utils/CodeExtractor.cpp
-Function *ExplorativeLVCtx::buildLoopFunction(unsigned VF, unsigned IF) {
+Function *LoopModuleBuilder::buildLoopFunc(unsigned VF, unsigned IF) {
   // Note that we actually modify the original loop here.  According to the docs
   // the metadata is attached to the branch instructions in the latches, so it
   // might be a bit difficult to directly add the metadata to the new
@@ -451,7 +478,7 @@ Function *ExplorativeLVCtx::buildLoopFunction(unsigned VF, unsigned IF) {
   SmallVector<std::pair<unsigned, MDNode *>, 1> MDs;
   OrigFunc.getAllMetadata(MDs);
   for (auto MD : MDs) {
-    LoopFunc->addMetadata(MD.first, *MapMetadata(MD.second, VMap));
+    LoopFunc->addMetadata(MD.first, *Mapper.mapMDNode(*MD.second));
   }
 
   // Loop over all of the instructions in the new function, fixing up operand
@@ -459,30 +486,28 @@ Function *ExplorativeLVCtx::buildLoopFunction(unsigned VF, unsigned IF) {
   for (BasicBlock &BB : *LoopFunc) {
     // Loop over all instructions, fixing each one as we find it...
     for (Instruction &II : BB)
-      RemapInstruction(&II, VMap);
+      Mapper.remapInstruction(II);
   }
 
   LoopFuncs.push_back(LoopFunc);
   return LoopFunc;
 }
 
-void ExplorativeLVCtx::buildMainFunctionBody() {
+void LoopModuleBuilder::buildMainFuncBody() {
   LLVMContext &C = M->getContext();
 
-  Function *MainFunc = M->getFunction("main");
-  if (!MainFunc) {
-    MainFunc = Function::Create(FunctionType::get(Type::getInt32Ty(C), false),
-                                GlobalValue::ExternalLinkage, "main", M);
-  }
+  Function *MainFunc =
+      Function::Create(FunctionType::get(Type::getInt32Ty(C), false),
+                       GlobalValue::ExternalLinkage, "main", M);
 
-  // TODO: what happens if this function is already declared?
-  // -> use M->getOrInsertFunction?
+  // Declare `clock_t clock(void)`
   static_assert(sizeof(clock_t) == 8, "clock_t is assumed to be 64 bit");
   FunctionType *ClockFuncTy = FunctionType::get(Type::getInt64Ty(C), false);
   Function *ClockFunc =
       Function::Create(ClockFuncTy, GlobalValue::ExternalLinkage,
                        OrigFunc.getAddressSpace(), "clock", M);
 
+  // Declare `int printf(char *format, ...)`
   FunctionType *PrintfFuncTy =
       FunctionType::get(Type::getInt32Ty(C), {Type::getInt8PtrTy(C)}, true);
   Function *PrintfFunc =
@@ -535,7 +560,7 @@ void ExplorativeLVCtx::buildMainFunctionBody() {
     CallInst *TStart = CallInst::Create(ClockFuncTy, ClockFunc, "ts", BB);
 
     // Call the function many times to get stable results (hopefully)
-    for (unsigned I = 0; I < 1024; ++I) // TODO: which N should we choose?
+    for (unsigned I = 0; I < 4; ++I) // TODO: which N should we choose?
       CallInst::Create(LoopFuncTy, LoopFunc, Args, "", BB);
 
     CallInst *TEnd = CallInst::Create(ClockFuncTy, ClockFunc, "te", BB);
@@ -680,7 +705,14 @@ struct ExplorativeLVPass::OptPipelineContainer {
     PB.registerLoopAnalyses(LAM);
     PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
 
-    MPM = PB.buildPerModuleDefaultPipeline(OptimizationLevel::O3);
+    if (ExploreDumpModuleIR) {
+      MPM.addPass(PrintModulePass(outs()));
+      MPM.addPass(PB.buildPerModuleDefaultPipeline(OptimizationLevel::O3));
+    } else {
+      // This is more efficient as the vector containing the passes can be moved
+      // and does not have to be copied.
+      MPM = PB.buildPerModuleDefaultPipeline(OptimizationLevel::O3);
+    }
   }
 
   void run(Module &M) {
@@ -712,23 +744,26 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L,
                                     TargetLibraryInfo &TLI) {
   assert(OptPipeline && "OptPipeline not initialized");
 
-  ExplorativeLVCtx Ctx(F, L, ExplorativeLV == ExplorativeLVMetric::Benchmark);
+  LoopModuleBuilder Builder(F, L, ExplorativeLV == Metric::Benchmark);
+  Module *M = Builder.getModule();
+  if (!M)
+    return true;
 
   unsigned LowestCostVF = 1;
   unsigned LowestCostIF = 1;
-  if (ExplorativeLV != ExplorativeLVMetric::Benchmark) {
+  if (ExplorativeLV != Metric::Benchmark) {
     unsigned LowestCost = UINT_MAX;
     // Try out which VF works best for this loop
-    for (unsigned VF = 1; VF <= 16; VF *= 2) {
-      for (unsigned IF = 1; IF <= 8; IF *= 2) {
-        Function *LoopFunc = Ctx.buildLoopFunction(VF, IF);
-        OptPipeline->run(Ctx.getModule());
+    for (unsigned VF = 1; VF <= ExploreMaxVF; VF *= 2) {
+      for (unsigned IF = 1; IF <= ExploreMaxIF; IF *= 2) {
+        Function *LoopFunc = Builder.buildLoopFunc(VF, IF);
+        OptPipeline->run(*M);
 
         unsigned Result;
         // Expensive, but: If we are using llvm-mca for evaluation, we need
         // a new backend pipeline for each iteration as the print stream is
         // dead after one use
-        if (ExplorativeLV == ExplorativeLVMetric::MCA) {
+        if (ExplorativeLV == Metric::MCA) {
           int ASMFD;
           SmallString<32> ASMPath;
           sys::fs::createTemporaryFile("explorative-lv", "s", ASMFD, ASMPath);
@@ -737,12 +772,12 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L,
             raw_fd_ostream OS(ASMFD, true);
             legacy::PassManager CGPipeline;
             initCodeGen(CGPipeline, *TM, TLI, OS, CGFT_AssemblyFile);
-            CGPipeline.run(Ctx.getModule());
+            CGPipeline.run(*M);
           }
           // Perform the cost calculation after the pipeline is deleted, to
           // make sure the assembly printer has finished
           Result = performMCACostCalc(ASMPath, TM->getTargetCPU(),
-                                      Ctx.getModule().getTargetTriple());
+                                      M->getTargetTriple());
         } else {
           // Set MCInstCount to 1 to tell MCExplorer to only go for loops,
           // to anything else to have it count all MCInsts in function
@@ -754,10 +789,10 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L,
           } else {
             LoopFunc->getContext().setScalarExploration(false);
           }
-          NullCGPipeline->PM.run(Ctx.getModule());
+          NullCGPipeline->PM.run(*M);
           Result = LoopFunc->getContext().getMCInstCount();
         }
-        Ctx.clearLoopFuncs();
+        Builder.clearLoopFuncs();
 
         if (Result == UINT_MAX) {
           LLVM_DEBUG(dbgs() << "Explorative LV: Invalid costs for VF " << VF
@@ -784,15 +819,15 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L,
     }
   } else {
     // Build a module containing functions for all VF/IF combinations
-    for (unsigned VF = 1; VF <= 16; VF *= 2) {
-      for (unsigned IF = 1; IF <= 8; IF *= 2)
-        Ctx.buildLoopFunction(VF, IF);
+    for (unsigned VF = 1; VF <= ExploreMaxVF; VF *= 2) {
+      for (unsigned IF = 1; IF <= ExploreMaxIF; IF *= 2)
+        Builder.buildLoopFunc(VF, IF);
     }
 
-    OptPipeline->run(Ctx.getModule());
+    OptPipeline->run(*M);
 
     // Build the main function -- no need to optimize it
-    Ctx.buildMainFunctionBody();
+    Builder.buildMainFuncBody();
 
     // Run code generation pipeline
     SmallString<32> ObjectPath;
@@ -803,7 +838,7 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L,
       raw_fd_ostream OS(ObjectFD, true);
       legacy::PassManager CGPipeline;
       initCodeGen(CGPipeline, *TM, TLI, OS, CGFT_ObjectFile);
-      CGPipeline.run(Ctx.getModule());
+      CGPipeline.run(*M);
     }
 
     // Create an executable
@@ -840,8 +875,8 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L,
     StringRef BenchRes = BenchResBuf.get()->getBuffer();
 
     uint64_t LowestCost = UINT64_MAX;
-    for (unsigned VF = 1; VF <= 16; VF *= 2) {
-      for (unsigned IF = 1; IF <= 8; IF *= 2) {
+    for (unsigned VF = 1; VF <= ExploreMaxVF; VF *= 2) {
+      for (unsigned IF = 1; IF <= ExploreMaxIF; IF *= 2) {
         uint64_t Result;
         if (BenchRes.consumeInteger(10, Result)) {
           errs() << "Explorative LV: could not read integer";
@@ -927,7 +962,7 @@ PreservedAnalyses ExplorativeLVPass::run(Function &F,
   if (!OptPipeline)
     OptPipeline = new OptPipelineContainer(TM, PTO, PGOOpt, TLI);
   // If this is a code size evaluation, we can re-use the same backend pipeline.
-  if (!NullCGPipeline && ExplorativeLV == ExplorativeLVMetric::InstCount)
+  if (!NullCGPipeline && ExplorativeLV == Metric::InstCount)
     NullCGPipeline = new NullCGPipelineContainer(*TM, TLI);
 
   do {

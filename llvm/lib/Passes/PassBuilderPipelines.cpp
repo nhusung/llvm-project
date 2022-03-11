@@ -225,7 +225,7 @@ extern cl::opt<bool> EnableMatrix;
 extern cl::opt<bool> DisablePreInliner;
 extern cl::opt<int> PreInlineThreshold;
 
-extern cl::opt<ExplorativeLVMetric> ExplorativeLV;
+extern cl::opt<ExplorativeLVPass::Metric> ExplorativeLV;
 } // namespace llvm
 
 void PassBuilder::invokePeepholeEPCallbacks(FunctionPassManager &FPM,
@@ -994,7 +994,7 @@ void PassBuilder::addVectorPasses(OptimizationLevel Level,
                                   FunctionPassManager &FPM, bool IsFullLTO) {
   // Run the exploration pass to determine the best vectorization and
   // interleaving factor to use
-  if (ExplorativeLV != ExplorativeLVMetric::Disable)
+  if (ExplorativeLV != ExplorativeLVPass::Metric::Disable)
     FPM.addPass(ExplorativeLVPass(TM, PTO, PGOOpt));
 
   FPM.addPass(LoopVectorizePass(
