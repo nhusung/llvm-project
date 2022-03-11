@@ -564,8 +564,8 @@ void LoopModuleBuilder::buildMainFuncBody() {
   Argument *CFuncArg = CalibFunc->getArg(0);
   CFuncArg->setName("func");
 
-  BasicBlock *BBStart = BasicBlock::Create(C, "bench_start", BenchFunc);
-  BasicBlock *BBCStart = BasicBlock::Create(C, "calib_start", CalibFunc);
+  BasicBlock *StartBB = BasicBlock::Create(C, "bench_start", BenchFunc);
+  BasicBlock *CStartBB = BasicBlock::Create(C, "calib_start", CalibFunc);
 
   SmallVector<Value *> Args;
   SmallVector<Value *> CArgs;
@@ -587,65 +587,65 @@ void LoopModuleBuilder::buildMainFuncBody() {
     for (auto *End = LoopFuncTy->param_end(); It != End; ++It) {
       Args.push_back(
           new AllocaInst(cast<PointerType>(*It)->getPointerElementType(),
-                         BenchFunc->getAddressSpace(), "outarg", BBStart));
+                         BenchFunc->getAddressSpace(), "outarg", StartBB));
       CArgs.push_back(
           new AllocaInst(cast<PointerType>(*It)->getPointerElementType(),
-                         CalibFunc->getAddressSpace(), "outarg", BBCStart));
+                         CalibFunc->getAddressSpace(), "outarg", CStartBB));
     }
   }
 
   // Warmup (benchmarking only)
   for (unsigned I = 0; I < ExploreBenchmarkWarmup; ++I)
-    CallInst::Create(LoopFuncTy, FuncArg, Args, "", BBStart);
+    CallInst::Create(LoopFuncTy, FuncArg, Args, "", StartBB);
 
   // Start measuring
-  CallInst *TStart = CallInst::Create(ClockFuncTy, ClockFunc, "ts", BBStart);
-  CallInst *CTStart = CallInst::Create(ClockFuncTy, ClockFunc, "ts", BBCStart);
+  CallInst *TStart = CallInst::Create(ClockFuncTy, ClockFunc, "ts", StartBB);
+  CallInst *CTStart = CallInst::Create(ClockFuncTy, ClockFunc, "ts", CStartBB);
 
   // Benchmarking loop
-  BasicBlock *BBLoop = BasicBlock::Create(C, "bench_loop", BenchFunc);
-  BranchInst::Create(BBLoop, BBStart);
-  PHINode *CountPhi = PHINode::Create(I32Ty, 2, "counter", BBLoop);
-  CountPhi->addIncoming(I320, BBStart);
+  BasicBlock *LoopBB = BasicBlock::Create(C, "bench_loop", BenchFunc);
+  BranchInst::Create(LoopBB, StartBB);
+  PHINode *CountPhi = PHINode::Create(I32Ty, 2, "counter", LoopBB);
+  CountPhi->addIncoming(I320, StartBB);
 
-  BasicBlock *BBCLoop = BasicBlock::Create(C, "calib_loop", CalibFunc);
-  BranchInst::Create(BBCLoop, BBCStart);
-  PHINode *CCountPhi = PHINode::Create(I32Ty, 2, "counter", BBCLoop);
-  CCountPhi->addIncoming(I320, BBCStart);
+  BasicBlock *CLoopBB = BasicBlock::Create(C, "calib_loop", CalibFunc);
+  BranchInst::Create(CLoopBB, CStartBB);
+  PHINode *CCountPhi = PHINode::Create(I32Ty, 2, "counter", CLoopBB);
+  CCountPhi->addIncoming(I320, CStartBB);
 
   for (unsigned I = 0; I < ExploreBenchmarkLoopSize; ++I) {
-    CallInst::Create(LoopFuncTy, FuncArg, Args, "", BBLoop);
-    CallInst::Create(LoopFuncTy, CFuncArg, CArgs, "", BBCLoop);
+    CallInst::Create(LoopFuncTy, FuncArg, Args, "", LoopBB);
+    CallInst::Create(LoopFuncTy, CFuncArg, CArgs, "", CLoopBB);
   }
 
   // Counters and continue/exit conditions
-  ICmpInst *ContLoop = new ICmpInst(*BBLoop, CmpInst::ICMP_ULT, CountPhi, NArg);
+  ICmpInst *ContLoop = new ICmpInst(*LoopBB, CmpInst::ICMP_ULT, CountPhi, NArg);
   BinaryOperator *CountAdd =
-      BinaryOperator::CreateAdd(CountPhi, I321, "counter_next", BBLoop);
+      BinaryOperator::CreateAdd(CountPhi, I321, "counter_next", LoopBB);
 
-  CallInst *CTNow = CallInst::Create(ClockFuncTy, ClockFunc, "tn", BBCLoop);
+  CallInst *CTNow = CallInst::Create(ClockFuncTy, ClockFunc, "tn", CLoopBB);
   BinaryOperator *CTDiff =
-      BinaryOperator::CreateSub(CTNow, CTStart, "dt", BBCLoop);
+      BinaryOperator::CreateSub(CTNow, CTStart, "dt", CLoopBB);
   ICmpInst *CContLoop =
-      new ICmpInst(*BBCLoop, CmpInst::ICMP_ULT, CTDiff,
+      new ICmpInst(*CLoopBB, CmpInst::ICMP_ULT, CTDiff,
                    ConstantInt::get(I64Ty, ExploreBenchmarkTicks));
   BinaryOperator *CCountAdd =
-      BinaryOperator::CreateAdd(CCountPhi, I321, "counter_next", BBCLoop);
+      BinaryOperator::CreateAdd(CCountPhi, I321, "counter_next", CLoopBB);
 
   // Branch at the end of the loop
-  BasicBlock *BBEval = BasicBlock::Create(C, "bench_eval", BenchFunc);
-  BranchInst::Create(BBLoop, BBEval, ContLoop, BBLoop);
-  CountPhi->addIncoming(CountAdd, BBLoop);
+  BasicBlock *EvalBB = BasicBlock::Create(C, "bench_eval", BenchFunc);
+  BranchInst::Create(LoopBB, EvalBB, ContLoop, LoopBB);
+  CountPhi->addIncoming(CountAdd, LoopBB);
 
-  BasicBlock *BBCRet = BasicBlock::Create(C, "calib_ret", CalibFunc);
-  BranchInst::Create(BBCLoop, BBCRet, CContLoop, BBCLoop);
-  CCountPhi->addIncoming(CCountAdd, BBCLoop);
+  BasicBlock *CRetBB = BasicBlock::Create(C, "calib_ret", CalibFunc);
+  BranchInst::Create(CLoopBB, CRetBB, CContLoop, CLoopBB);
+  CCountPhi->addIncoming(CCountAdd, CLoopBB);
   // For calibration, we are already done
-  ReturnInst::Create(C, CCountAdd, BBCRet);
+  ReturnInst::Create(C, CCountAdd, CRetBB);
 
   // Stop measuring
-  CallInst *TEnd = CallInst::Create(ClockFuncTy, ClockFunc, "te", BBEval);
-  BinaryOperator *TDiff = BinaryOperator::CreateSub(TEnd, TStart, "dt", BBEval);
+  CallInst *TEnd = CallInst::Create(ClockFuncTy, ClockFunc, "te", EvalBB);
+  BinaryOperator *TDiff = BinaryOperator::CreateSub(TEnd, TStart, "dt", EvalBB);
 
   // Create format string
   static_assert(sizeof(unsigned long long) == 8,
@@ -659,20 +659,20 @@ void LoopModuleBuilder::buildMainFuncBody() {
       ArrayRef<Constant *>{I640, I640});
 
   // `printf(fstr, dt); return;`
-  CallInst::Create(PrintfFuncTy, PrintfFunc, {FormatStrPtr, TDiff}, "", BBEval);
-  ReturnInst::Create(C, BBEval);
+  CallInst::Create(PrintfFuncTy, PrintfFunc, {FormatStrPtr, TDiff}, "", EvalBB);
+  ReturnInst::Create(C, EvalBB);
 
   // Declare & define `int main(void)`
   Function *MainFunc = Function::Create(
       FunctionType::get(I32Ty, false), GlobalValue::ExternalLinkage, "main", M);
 
-  BasicBlock *BBMain = BasicBlock::Create(C, "main", MainFunc);
+  BasicBlock *MainBB = BasicBlock::Create(C, "main", MainFunc);
   CallInst *NRuns =
-      CallInst::Create(CalibFuncTy, CalibFunc, {LoopFuncs[0]}, "n", BBMain);
+      CallInst::Create(CalibFuncTy, CalibFunc, {LoopFuncs[0]}, "n", MainBB);
   for (Function *LoopFunc : LoopFuncs)
-    CallInst::Create(BenchFuncTy, BenchFunc, {LoopFunc, NRuns}, "", BBMain);
+    CallInst::Create(BenchFuncTy, BenchFunc, {LoopFunc, NRuns}, "", MainBB);
 
-  ReturnInst::Create(C, I320, BBMain);
+  ReturnInst::Create(C, I320, MainBB);
 }
 
 } // end anonymous namespace
