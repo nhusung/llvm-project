@@ -24,8 +24,14 @@
 #include "llvm/Analysis/CFG.h"
 #include "llvm/Analysis/LoopIterator.h"
 #include "llvm/Analysis/ScalarEvolution.h"
+#include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/Constants.h"
 #include "llvm/IR/DebugInfo.h"
+#include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/GlobalValue.h"
 #include "llvm/IR/IRPrintingPasses.h"
+#include "llvm/IR/InstrTypes.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/Passes/StandardInstrumentations.h"
 #include "llvm/Support/Debug.h"
@@ -36,6 +42,7 @@
 #include "llvm/Support/Program.h"
 #include "llvm/Transforms/ObjCARC.h"
 #include "llvm/Transforms/Utils/Cloning.h"
+#include <ctime>
 
 using namespace llvm;
 #define DEBUG_TYPE "explorative-lv"
@@ -66,6 +73,21 @@ static cl::opt<unsigned>
     ExploreMaxIF("explore-max-if", cl::Hidden, cl::init(8),
                  cl::desc("The maximum interleaving factor to use for "
                           "explorative loop vectorization"));
+
+static cl::opt<uint64_t>
+    ExploreBenchmarkTicks("explore-benchmark-ticks", cl::Hidden,
+                          cl::init(CLOCKS_PER_SEC / 10),
+                          cl::desc("In benchmarking mode: use this number of "
+                                   "clock ticks for calibration"));
+static cl::opt<unsigned> ExploreBenchmarkWarmup(
+    "explore-benchmark-warmup", cl::Hidden, cl::init(16),
+    cl::desc("In benchmarking mode: how many times to call each loop function "
+             "before benchmarking"));
+static cl::opt<unsigned>
+    ExploreBenchmarkLoopSize("explore-benchmark-loop-size", cl::Hidden,
+                             cl::init(32),
+                             cl::desc("In benchmarking mode: size (loop "
+                                      "function calls) of the benchmark loop"));
 
 static cl::opt<bool>
     ExplorePlain("explore-plain", cl::Hidden, cl::init(false),
@@ -126,6 +148,7 @@ public:
   void buildMainFuncBody();
 
   Function *buildLoopFunc(unsigned VF, unsigned IF);
+  unsigned getNumLoopFuncs() { return LoopFuncs.size(); }
   void clearLoopFuncs() {
     for (Function *LoopFunc : LoopFuncs) {
       LoopFunc->eraseFromParent();
@@ -496,30 +519,56 @@ Function *LoopModuleBuilder::buildLoopFunc(unsigned VF, unsigned IF) {
 void LoopModuleBuilder::buildMainFuncBody() {
   LLVMContext &C = M->getContext();
 
-  Function *MainFunc =
-      Function::Create(FunctionType::get(Type::getInt32Ty(C), false),
-                       GlobalValue::ExternalLinkage, "main", M);
+  // Some types and values we will use a few times
+  Type *I32Ty = Type::getInt32Ty(C);
+  Type *I64Ty = Type::getInt32Ty(C);
+  Constant *I320 = ConstantInt::get(I32Ty, 0);
+  Constant *I321 = ConstantInt::get(I32Ty, 1);
+  Constant *I640 = ConstantInt::get(I64Ty, 0);
+
+  assert(LoopFuncs.size() > 0 && "No loop functions generated yet");
+  FunctionType *LoopFuncTy = LoopFuncs[0]->getFunctionType();
+  PointerType *LoopFuncPtrTy = LoopFuncs[0]->getType();
 
   // Declare `clock_t clock(void)`
   static_assert(sizeof(clock_t) == 8, "clock_t is assumed to be 64 bit");
-  FunctionType *ClockFuncTy = FunctionType::get(Type::getInt64Ty(C), false);
+  FunctionType *ClockFuncTy = FunctionType::get(I64Ty, false);
   Function *ClockFunc =
       Function::Create(ClockFuncTy, GlobalValue::ExternalLinkage,
                        OrigFunc.getAddressSpace(), "clock", M);
 
   // Declare `int printf(char *format, ...)`
   FunctionType *PrintfFuncTy =
-      FunctionType::get(Type::getInt32Ty(C), {Type::getInt8PtrTy(C)}, true);
+      FunctionType::get(I32Ty, {Type::getInt8PtrTy(C)}, true);
   Function *PrintfFunc =
       Function::Create(PrintfFuncTy, GlobalValue::ExternalLinkage,
                        OrigFunc.getAddressSpace(), "printf", M);
 
-  assert(LoopFuncs.size() > 0 && "No loop functions generated yet");
-  FunctionType *LoopFuncTy = LoopFuncs[0]->getFunctionType();
+  // We build a benchmarking function that takes a loop function and an integer
+  // n as argument and the function n * ExploreBenchmarkLoopSize times.  This
+  // function itself is called by `int main(void)`.
+  // To infer a suitable n, we build a calibration function that counts the
+  // repitions needed until the elapsed time exceeds some threshold.
+  FunctionType *BenchFuncTy =
+      FunctionType::get(Type::getVoidTy(C), {LoopFuncPtrTy, I32Ty}, false);
+  Function *BenchFunc =
+      Function::Create(BenchFuncTy, GlobalValue::PrivateLinkage, "bench", M);
+  FunctionType *CalibFuncTy = FunctionType::get(I32Ty, {LoopFuncPtrTy}, false);
+  Function *CalibFunc =
+      Function::Create(CalibFuncTy, GlobalValue::PrivateLinkage, "calib", M);
 
-  BasicBlock *BB = BasicBlock::Create(C, "main", MainFunc);
+  Argument *FuncArg = BenchFunc->getArg(0);
+  FuncArg->setName("func");
+  Argument *NArg = BenchFunc->getArg(1);
+  NArg->setName("n");
+  Argument *CFuncArg = CalibFunc->getArg(0);
+  CFuncArg->setName("func");
+
+  BasicBlock *BBStart = BasicBlock::Create(C, "bench_start", BenchFunc);
+  BasicBlock *BBCStart = BasicBlock::Create(C, "calib_start", CalibFunc);
 
   SmallVector<Value *> Args;
+  SmallVector<Value *> CArgs;
   /* Create arguments */ {
     assert(Inputs.size() <= LoopFuncTy->getNumParams());
 
@@ -531,15 +580,72 @@ void LoopModuleBuilder::buildMainFuncBody() {
     for (; It != OutputParamsBegin; ++It) {
       // FIXME: we should use more meaningful values
       Args.push_back(Constant::getNullValue(*It));
+      CArgs.push_back(Constant::getNullValue(*It));
     }
 
     // Alloc locations for output parameters
     for (auto *End = LoopFuncTy->param_end(); It != End; ++It) {
       Args.push_back(
           new AllocaInst(cast<PointerType>(*It)->getPointerElementType(),
-                         MainFunc->getAddressSpace(), "outarg", BB));
+                         BenchFunc->getAddressSpace(), "outarg", BBStart));
+      CArgs.push_back(
+          new AllocaInst(cast<PointerType>(*It)->getPointerElementType(),
+                         CalibFunc->getAddressSpace(), "outarg", BBCStart));
     }
   }
+
+  // Warmup (benchmarking only)
+  for (unsigned I = 0; I < ExploreBenchmarkWarmup; ++I)
+    CallInst::Create(LoopFuncTy, FuncArg, Args, "", BBStart);
+
+  // Start measuring
+  CallInst *TStart = CallInst::Create(ClockFuncTy, ClockFunc, "ts", BBStart);
+  CallInst *CTStart = CallInst::Create(ClockFuncTy, ClockFunc, "ts", BBCStart);
+
+  // Benchmarking loop
+  BasicBlock *BBLoop = BasicBlock::Create(C, "bench_loop", BenchFunc);
+  BranchInst::Create(BBLoop, BBStart);
+  PHINode *CountPhi = PHINode::Create(I32Ty, 2, "counter", BBLoop);
+  CountPhi->addIncoming(I320, BBStart);
+
+  BasicBlock *BBCLoop = BasicBlock::Create(C, "calib_loop", CalibFunc);
+  BranchInst::Create(BBCLoop, BBCStart);
+  PHINode *CCountPhi = PHINode::Create(I32Ty, 2, "counter", BBCLoop);
+  CCountPhi->addIncoming(I320, BBCStart);
+
+  for (unsigned I = 0; I < ExploreBenchmarkLoopSize; ++I) {
+    CallInst::Create(LoopFuncTy, FuncArg, Args, "", BBLoop);
+    CallInst::Create(LoopFuncTy, CFuncArg, CArgs, "", BBCLoop);
+  }
+
+  // Counters and continue/exit conditions
+  ICmpInst *ContLoop = new ICmpInst(*BBLoop, CmpInst::ICMP_ULT, CountPhi, NArg);
+  BinaryOperator *CountAdd =
+      BinaryOperator::CreateAdd(CountPhi, I321, "counter_next", BBLoop);
+
+  CallInst *CTNow = CallInst::Create(ClockFuncTy, ClockFunc, "tn", BBCLoop);
+  BinaryOperator *CTDiff =
+      BinaryOperator::CreateSub(CTNow, CTStart, "dt", BBCLoop);
+  ICmpInst *CContLoop =
+      new ICmpInst(*BBCLoop, CmpInst::ICMP_ULT, CTDiff,
+                   ConstantInt::get(I64Ty, ExploreBenchmarkTicks));
+  BinaryOperator *CCountAdd =
+      BinaryOperator::CreateAdd(CCountPhi, I321, "counter_next", BBCLoop);
+
+  // Branch at the end of the loop
+  BasicBlock *BBEval = BasicBlock::Create(C, "bench_eval", BenchFunc);
+  BranchInst::Create(BBLoop, BBEval, ContLoop, BBLoop);
+  CountPhi->addIncoming(CountAdd, BBLoop);
+
+  BasicBlock *BBCRet = BasicBlock::Create(C, "calib_ret", CalibFunc);
+  BranchInst::Create(BBCLoop, BBCRet, CContLoop, BBCLoop);
+  CCountPhi->addIncoming(CCountAdd, BBCLoop);
+  // For calibration, we are already done
+  ReturnInst::Create(C, CCountAdd, BBCRet);
+
+  // Stop measuring
+  CallInst *TEnd = CallInst::Create(ClockFuncTy, ClockFunc, "te", BBEval);
+  BinaryOperator *TDiff = BinaryOperator::CreateSub(TEnd, TStart, "dt", BBEval);
 
   // Create format string
   static_assert(sizeof(unsigned long long) == 8,
@@ -547,28 +653,26 @@ void LoopModuleBuilder::buildMainFuncBody() {
   Constant *FormatStr = ConstantDataArray::getString(C, "%llu\n\0", false);
   GlobalVariable *FormatStrGV =
       new GlobalVariable(*M, FormatStr->getType(), true,
-                         GlobalValue::InternalLinkage, FormatStr, "fstr");
-  Constant *I640 = Constant::getNullValue(Type::getInt64Ty(C));
+                         GlobalValue::PrivateLinkage, FormatStr, "fstr");
   Constant *FormatStrPtr = ConstantExpr::getInBoundsGetElementPtr(
       FormatStrGV->getValueType(), FormatStrGV,
       ArrayRef<Constant *>{I640, I640});
 
-  for (Function *LoopFunc : LoopFuncs) {
-    // One run that we do not count
-    CallInst::Create(LoopFuncTy, LoopFunc, Args, "", BB);
+  // `printf(fstr, dt); return;`
+  CallInst::Create(PrintfFuncTy, PrintfFunc, {FormatStrPtr, TDiff}, "", BBEval);
+  ReturnInst::Create(C, BBEval);
 
-    CallInst *TStart = CallInst::Create(ClockFuncTy, ClockFunc, "ts", BB);
+  // Declare & define `int main(void)`
+  Function *MainFunc = Function::Create(
+      FunctionType::get(I32Ty, false), GlobalValue::ExternalLinkage, "main", M);
 
-    // Call the function many times to get stable results (hopefully)
-    for (unsigned I = 0; I < 4; ++I) // TODO: which N should we choose?
-      CallInst::Create(LoopFuncTy, LoopFunc, Args, "", BB);
+  BasicBlock *BBMain = BasicBlock::Create(C, "main", MainFunc);
+  CallInst *NRuns =
+      CallInst::Create(CalibFuncTy, CalibFunc, {LoopFuncs[0]}, "n", BBMain);
+  for (Function *LoopFunc : LoopFuncs)
+    CallInst::Create(BenchFuncTy, BenchFunc, {LoopFunc, NRuns}, "", BBMain);
 
-    CallInst *TEnd = CallInst::Create(ClockFuncTy, ClockFunc, "te", BB);
-    BinaryOperator *TDiff = BinaryOperator::CreateSub(TEnd, TStart, "dt", BB);
-    CallInst::Create(PrintfFuncTy, PrintfFunc, {FormatStrPtr, TDiff}, "", BB);
-  }
-
-  ReturnInst::Create(C, Constant::getNullValue(MainFunc->getReturnType()), BB);
+  ReturnInst::Create(C, I320, BBMain);
 }
 
 } // end anonymous namespace
@@ -837,6 +941,7 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L,
     {
       raw_fd_ostream OS(ObjectFD, true);
       legacy::PassManager CGPipeline;
+      // CGPipeline.add(createPrintModulePass(outs()));
       initCodeGen(CGPipeline, *TM, TLI, OS, CGFT_ObjectFile);
       CGPipeline.run(*M);
     }
@@ -857,12 +962,17 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L,
     }
 
     // Do the benchmarking
+    unsigned TimeoutS =
+        1 + ((Builder.getNumLoopFuncs() + 1) * ExploreBenchmarkTicks) /
+                CLOCKS_PER_SEC;
+    dbgs() << "Explorative LV: Benchmarking for up to " << TimeoutS
+           << " s ...\n";
     SmallString<32> BenchResPath;
     sys::fs::createTemporaryFile("explorative-lv-out", "txt", BenchResPath);
     FileRemover BenchResRemover(BenchResPath);
-    if (sys::ExecuteAndWait(
-            ExecPath, {"explorative-lv"}, None,
-            {StringRef(""), BenchResPath.str(), StringRef("")}) != 0) {
+    if (sys::ExecuteAndWait(ExecPath, {"explorative-lv"}, None,
+                            {StringRef(""), BenchResPath.str(), StringRef("")},
+                            TimeoutS) != 0) {
       errs() << "Explorative LV: benchmarking failed\n";
       return true;
     }
@@ -902,7 +1012,7 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L,
   // cost
   LLVM_DEBUG(
       dbgs() << "Explorative LV: Choosing this VF and IF for vectorization: "
-             << LowestCostVF << " and " << LowestCostIF << "\n\n");
+             << LowestCostVF << " and " << LowestCostIF << "\n");
   addStringMetadataToLoop(&L, "llvm.loop.vectorize.width", LowestCostVF);
   addStringMetadataToLoop(&L, "llvm.loop.interleave.count", LowestCostIF);
 
