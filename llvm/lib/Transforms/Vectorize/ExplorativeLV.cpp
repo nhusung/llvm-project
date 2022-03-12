@@ -352,13 +352,8 @@ Function *LoopModuleBuilder::buildLoopFunc(unsigned VF, unsigned IF) {
     }
   }
 
-  BasicBlock *BeginBB = BasicBlock::Create(C, "loop_begin", LoopFunc);
-  BasicBlock *EndBB = BasicBlock::Create(C, "loop_end", LoopFunc);
-  ReturnInst *Ret = ReturnInst::Create(C, EndBB);
-
-  VMap[BeginBB] = BeginBB;
-  VMap[EndBB] = EndBB;
-  VMap[Ret] = Ret;
+  BasicBlock *PreHdrBB = BasicBlock::Create(C, "loop.preheader", LoopFunc);
+  VMap[PreHdrBB] = PreHdrBB;
 
   // Copy argument attributes (~~> CloneFunctionInto)
   AttributeList LoopAttrs = LoopFunc->getAttributes();
@@ -395,13 +390,12 @@ Function *LoopModuleBuilder::buildLoopFunc(unsigned VF, unsigned IF) {
   //   1. loop_begin
   //   2. cloned loop blocks
   //   3. store blocks
-  //   4. loop_end
-  BasicBlock *LoopBBInsertBefore = EndBB;
+  BasicBlock *FirstStoreBB = nullptr;
 
   // Loop over all of the basic blocks in the loop, cloning them as appropriate.
   for (const BasicBlock *BB : L.getBlocks()) {
     // Create a new basic block
-    BasicBlock *NewBB = BasicBlock::Create(C, "", LoopFunc, LoopBBInsertBefore);
+    BasicBlock *NewBB = BasicBlock::Create(C, "", LoopFunc, FirstStoreBB);
     if (BB->hasName())
       NewBB->setName(BB->getName() + ".l");
 
@@ -450,10 +444,9 @@ Function *LoopModuleBuilder::buildLoopFunc(unsigned VF, unsigned IF) {
         continue; // Not an exiting edge
       assert(SuccBB->getParent() == &OrigFunc);
 
-      BasicBlock *StoreBB =
-          BasicBlock::Create(C, "store_block", LoopFunc, EndBB);
-      if (LoopBBInsertBefore == EndBB)
-        LoopBBInsertBefore = StoreBB;
+      BasicBlock *StoreBB = BasicBlock::Create(C, "store_block", LoopFunc);
+      if (!FirstStoreBB)
+        FirstStoreBB = StoreBB;
       VMap[StoreBB] = StoreBB;
       NewTerm->setSuccessor(Idx, StoreBB);
 
@@ -481,26 +474,26 @@ Function *LoopModuleBuilder::buildLoopFunc(unsigned VF, unsigned IF) {
         ++OutputArg;
       }
 
-      BranchInst *EndBranch = BranchInst::Create(EndBB, StoreBB);
-      VMap[EndBranch] = EndBranch;
+      ReturnInst *Ret = ReturnInst::Create(C, nullptr, StoreBB);
+      VMap[Ret] = Ret;
     }
   }
 
   BasicBlock *NewLoopHeader =
-      LoopFunc->getBasicBlockList().getNextNode(*BeginBB);
-  BranchInst *Branch = BranchInst::Create(NewLoopHeader, BeginBB);
+      LoopFunc->getBasicBlockList().getNextNode(*PreHdrBB);
+  BranchInst *Branch = BranchInst::Create(NewLoopHeader, PreHdrBB);
   VMap[Branch] = Branch;
 
-  // The first basic block might have had multiple predecessors that were
-  // not part of the loop.  In our new setup, they are all replaced by
-  // BeginBB.  Update the PHINodes accordingly.  Since we have a (natural)
+  // The first basic block might have had multiple predecessors that were not
+  // part of the loop.  In our new setup, they are all replaced by the
+  // preheader.  Update the PHINodes accordingly.  Since we have a (natural)
   // loop, no other basic block than the loop header has predecedecessors
   // outside the loop.
   for (PHINode &P : NewLoopHeader->phis()) {
     for (BasicBlock **It = P.block_begin(), **End = P.block_end(); It != End;
          It++) {
       if (VMap.count(*It) == 0)
-        *It = BeginBB;
+        *It = PreHdrBB;
     }
   }
 
