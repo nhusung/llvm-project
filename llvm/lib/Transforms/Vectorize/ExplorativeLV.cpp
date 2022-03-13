@@ -265,7 +265,14 @@ Value *LoopModuleBuilder::materialize(Value *V) {
       return NF;
     }
 
-    return Constant::getNullValue(F->getType());
+    if (!F->isIntrinsic())
+      // We only call intrinsics.
+      return Constant::getNullValue(F->getType());
+
+    Function *NF = Function::Create(cast<FunctionType>(F->getValueType()),
+                                    F->getLinkage(), F->getName(), M);
+    NF->copyAttributesFrom(F);
+    return NF;
   }
 
   if (const GlobalAlias *GA = dyn_cast<GlobalAlias>(GVal)) {
