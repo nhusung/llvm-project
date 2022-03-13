@@ -316,6 +316,7 @@ Module *LoopModuleBuilder::getModule() {
   M->setTargetTriple(OrigM->getTargetTriple());
   if (!MakeExecutable) // Only copy inline ASM if we do not create an executable
     M->setModuleInlineAsm(OrigM->getModuleInlineAsm());
+
   // Clone named metadata
   for (const NamedMDNode &NMD : OrigM->named_metadata()) {
     NamedMDNode *NewNMD = M->getOrInsertNamedMetadata(NMD.getName());
@@ -436,8 +437,8 @@ Function *LoopModuleBuilder::buildLoopFunc(unsigned VF, unsigned IF) {
     // implementation, which generates an invalid BlockAddress when
     // cloning a function.)
     if (BB->hasAddressTaken()) {
-      Constant *OldBBAddr = BlockAddress::get(const_cast<Function *>(&OrigFunc),
-                                              const_cast<BasicBlock *>(BB));
+      const Constant *OldBBAddr = BlockAddress::get(
+          const_cast<Function *>(&OrigFunc), const_cast<BasicBlock *>(BB));
       VMap[OldBBAddr] = BlockAddress::get(LoopFunc, NewBB);
     }
 
@@ -508,6 +509,11 @@ Function *LoopModuleBuilder::buildLoopFunc(unsigned VF, unsigned IF) {
     }
   }
 
+  // Clone the MDMap such that such that we can reset it to the state where it
+  // just contained module-level metadata.  This is needed because there might
+  // be 'distinct' nodes that must not be shared by multiple loop functions.
+  auto MDModuleMap = VMap.MD();
+
   // Duplicate the metadata that is attached to the cloned function.
   // Subprograms/CUs/types that were already mapped to themselves won't be
   // duplicated.
@@ -524,6 +530,9 @@ Function *LoopModuleBuilder::buildLoopFunc(unsigned VF, unsigned IF) {
     for (Instruction &II : BB)
       Mapper.remapInstruction(II);
   }
+
+  // Restore MDMap
+  VMap.MD().swap(MDModuleMap);
 
   LoopFuncs.push_back(LoopFunc);
   return LoopFunc;
