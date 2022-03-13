@@ -114,8 +114,8 @@ static cl::opt<bool> ExploreDumpOptModuleIR(
 /// extracted region.
 static bool
 definedInRegion(const llvm::SmallPtrSetImpl<const llvm::BasicBlock *> &Blocks,
-                Value *V) {
-  if (Instruction *I = dyn_cast<Instruction>(V))
+                const Value *V) {
+  if (const Instruction *I = dyn_cast<Instruction>(V))
     return Blocks.contains(I->getParent());
   return false;
 }
@@ -129,8 +129,8 @@ class LoopModuleBuilder : public ValueMaterializer {
   Module *M = nullptr;
   ValueToValueMapTy VMap;
   ValueMapper Mapper;
-  SmallVector<Value *> Inputs;
-  SmallVector<Instruction *> Outputs;
+  SmallVector<const Value *> Inputs;
+  SmallVector<const Instruction *> Outputs;
   FunctionType *FuncTy;
   SmallVector<Function *> LoopFuncs;
 
@@ -169,26 +169,28 @@ bool LoopModuleBuilder::determineIO() {
   // generate an output parameter to produce an observable side-effect such that
   // the code is not optimized away.
 
-  SmallPtrSet<Value *, 32> ArgSet;
+  SmallPtrSet<const Value *, 32> ArgSet;
 
-  for (BasicBlock *BB : L.getBlocks()) {
-    for (Instruction &I : *BB) {
-      if (MakeExecutable && isa<CallBase>(I)) {
-        // Dealing with call instructions is hard.  If they have external
-        // linkage, the linker would probably fail.  One approach would be to
-        // replace them by dummy functions, but for now we refrain from
-        // analyzing these.  Inline assembly is also embedded using call
-        // instructions, we'd have to make these distinctions here.  However,
-        // we allow intrinsics.
-        if (!isa<IntrinsicInst>(I))
-          return false;
+  for (const BasicBlock *BB : L.getBlocks()) {
+    for (const Instruction &I : *BB) {
+      if (MakeExecutable) {
+        if (isa<CallBase>(I)) {
+          // Dealing with call instructions is hard.  If they have external
+          // linkage, the linker would probably fail.  One approach would be to
+          // replace them by dummy functions, but for now we refrain from
+          // analyzing these.  Inline assembly is also embedded using call
+          // instructions, we'd have to make these distinctions here.  However,
+          // we allow intrinsics.
+          if (!isa<IntrinsicInst>(I))
+            return false;
 
-        // TODO: are there intrinsics we should forbid?
+          // TODO: are there intrinsics we should forbid?
+        }
       }
 
       // Used inside loop and defined outside?
-      for (Value *Op : I.operand_values()) {
-        Instruction *OpInst = dyn_cast<Instruction>(Op);
+      for (const Value *Op : I.operand_values()) {
+        const Instruction *OpInst = dyn_cast<Instruction>(Op);
         if (OpInst) {
           if (L.getBlocksSet().contains(OpInst->getParent()))
             continue;
@@ -200,7 +202,7 @@ bool LoopModuleBuilder::determineIO() {
       }
 
       // Defined inside loop and used outside?
-      for (User *U : I.users())
+      for (const User *U : I.users())
         if (!definedInRegion(L.getBlocksSet(), U)) {
           Outputs.push_back(&I);
           break;
@@ -292,9 +294,9 @@ Value *LoopModuleBuilder::materialize(Value *V) {
 void LoopModuleBuilder::buildFuncTy() {
   SmallVector<Type *> Params;
   Params.reserve(Inputs.size() + Outputs.size());
-  for (Value *V : Inputs)
+  for (const Value *V : Inputs)
     Params.push_back(V->getType());
-  for (Instruction *I : Outputs)
+  for (const Instruction *I : Outputs)
     Params.push_back(PointerType::getUnqual(I->getType()));
 
   // Returns void, no varargs
@@ -349,14 +351,14 @@ Function *LoopModuleBuilder::buildLoopFunc(unsigned VF, unsigned IF) {
 
   /* Insert the generated function arguments into the VMap, add names */ {
     auto *ArgPtr = LoopFunc->arg_begin();
-    for (Value *OldV : Inputs) {
+    for (const Value *OldV : Inputs) {
       VMap[OldV] = ArgPtr;
       VMap[ArgPtr] = ArgPtr;
       if (OldV->hasName())
         ArgPtr->setName(OldV->getName() + ".i");
       ++ArgPtr;
     }
-    for (Instruction *I : Outputs) {
+    for (const Instruction *I : Outputs) {
       VMap[ArgPtr] = ArgPtr;
       if (I->hasName())
         ArgPtr->setName(I->getName() + ".o");
@@ -463,10 +465,10 @@ Function *LoopModuleBuilder::buildLoopFunc(unsigned VF, unsigned IF) {
       NewTerm->setSuccessor(Idx, StoreBB);
 
       Function::arg_iterator OutputArg = OutputArgsBegin;
-      for (Instruction *I : Outputs) {
+      for (const Instruction *I : Outputs) {
         assert(I->getParent()->getParent() == &OrigFunc);
-        for (User *U : I->users()) {
-          Instruction *UI = dyn_cast<Instruction>(U);
+        for (const User *U : I->users()) {
+          const Instruction *UI = dyn_cast<Instruction>(U);
           // A user might be in the new function as we have not remapped the
           // operands yet.  Just ignore these users.
           if (!UI || UI->getFunction() != &OrigFunc ||
