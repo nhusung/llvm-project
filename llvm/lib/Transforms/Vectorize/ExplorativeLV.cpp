@@ -104,6 +104,10 @@ static cl::opt<bool> ExploreDumpModuleIR(
     "explore-dump-module-ir", cl::Hidden, cl::init(false),
     cl::desc("If true, add a PrintModulePass at the beginning of the "
              "explorative optimization pipeline"));
+static cl::opt<bool> ExploreDumpOptModuleIR(
+    "explore-dump-opt-module-ir", cl::Hidden, cl::init(false),
+    cl::desc("If true, add a PrintModulePass at the beginning of the "
+             "explorative codegen pipeline"));
 
 // Function from CodeExtractor.cpp:
 /// definedInRegion - Return true if the specified value is defined in the
@@ -767,6 +771,9 @@ static unsigned performMCACostCalc(StringRef FileName, StringRef TargetCPU,
 static void initCodeGen(legacy::PassManager &PM, TargetMachine &TM,
                         const TargetLibraryInfo &TLI, raw_pwrite_stream &OS,
                         CodeGenFileType CGFT) {
+  if (ExploreDumpOptModuleIR)
+    PM.add(createPrintModulePass(outs()));
+
   // Add LibraryInfo.
   PM.add(new TargetLibraryInfoWrapperPass(TLI));
 
@@ -943,7 +950,6 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L,
     {
       raw_fd_ostream OS(ObjectFD, true);
       legacy::PassManager CGPipeline;
-      // CGPipeline.add(createPrintModulePass(outs()));
       initCodeGen(CGPipeline, *TM, TLI, OS, CGFT_ObjectFile);
       CGPipeline.run(*M);
     }
