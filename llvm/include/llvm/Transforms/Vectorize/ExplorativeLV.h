@@ -61,10 +61,6 @@ public:
 
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
 
-  static char ID; // Pass identification, replacement for typeid
-
-  static StringRef name() { return "ExplorativeLV"; }
-
   enum class Metric { Disable, InstCount, MCA, Benchmark };
 };
 
