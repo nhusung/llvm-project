@@ -109,17 +109,6 @@ static cl::opt<bool> ExploreDumpOptModuleIR(
     cl::desc("If true, add a PrintModulePass at the beginning of the "
              "explorative codegen pipeline"));
 
-// Function from CodeExtractor.cpp:
-/// definedInRegion - Return true if the specified value is defined in the
-/// extracted region.
-static bool
-definedInRegion(const llvm::SmallPtrSetImpl<const llvm::BasicBlock *> &Blocks,
-                const Value *V) {
-  if (const Instruction *I = dyn_cast<Instruction>(V))
-    return Blocks.contains(I->getParent());
-  return false;
-}
-
 namespace {
 
 class LoopModuleBuilder : public ValueMaterializer {
@@ -202,11 +191,15 @@ bool LoopModuleBuilder::determineIO() {
       }
 
       // Defined inside loop and used outside?
-      for (const User *U : I.users())
-        if (!definedInRegion(L.getBlocksSet(), U)) {
+      for (const User *U : I.users()) {
+        const Instruction *UI = dyn_cast<Instruction>(U);
+        if (!UI)
+          continue; // ignore users that aren't instructions
+        if (!L.getBlocksSet().contains(UI->getParent())) {
           Outputs.push_back(&I);
           break;
         }
+      }
     }
   }
 
