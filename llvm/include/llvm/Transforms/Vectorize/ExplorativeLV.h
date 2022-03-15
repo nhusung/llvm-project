@@ -23,10 +23,14 @@
 #ifndef LLVM_TRANSFORMS_EXPLORATIVELV_H
 #define LLVM_TRANSFORMS_EXPLORATIVELV_H
 
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/Passes/PassBuilder.h"
+#include <cassert>
 
 namespace llvm {
+
+struct MachineCodeExplorer;
 
 class ExplorativeLVPass : public PassInfoMixin<ExplorativeLVPass> {
   struct OptPipelineContainer;
@@ -44,7 +48,20 @@ class ExplorativeLVPass : public PassInfoMixin<ExplorativeLVPass> {
   // the pipeline every time, since we cannot simply replace the output stream.
   NullCGPipelineContainer *NullCGPipeline = nullptr;
 
-  bool processLoop(Function &F, Loop &L, TargetLibraryInfo &TLI);
+  bool processLoop(Function &F, Loop &L, ScalarEvolution &SE,
+                   TargetLibraryInfo &TLI);
+
+  struct EvaluationInfo {
+    unsigned VF;
+    unsigned IF;
+    uint64_t Costs;
+  };
+  DenseMap<Function *, EvaluationInfo> *EvaluationInfoMap = nullptr;
+  EvaluationInfo *getEvalutaionInfo(const Function &F) {
+    assert(EvaluationInfoMap && "No EvaluationInfoMap present");
+    auto It = EvaluationInfoMap->find(&F);
+    return It == EvaluationInfoMap->end() ? nullptr : &It->getSecond();
+  }
 
 public:
   ExplorativeLVPass(TargetMachine *TM, PipelineTuningOptions PTO,
@@ -53,6 +70,7 @@ public:
   ExplorativeLVPass(ExplorativeLVPass &&Pass)
       : TM(Pass.TM), PTO(Pass.PTO), PGOOpt(Pass.PGOOpt),
         OptPipeline(Pass.OptPipeline), NullCGPipeline(Pass.NullCGPipeline) {
+    assert(!EvaluationInfoMap && "EvaluationInfoMap present during move");
     Pass.OptPipeline = nullptr;
     Pass.NullCGPipeline = nullptr;
   }
@@ -62,6 +80,10 @@ public:
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
 
   enum class Metric { Disable, InstCount, MCA, Benchmark };
+
+  static const uint64_t InvalidCosts = UINT64_MAX;
+
+  friend struct MachineCodeExplorer;
 };
 
 } // namespace llvm

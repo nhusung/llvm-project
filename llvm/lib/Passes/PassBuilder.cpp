@@ -37,6 +37,7 @@
 #include "llvm/Analysis/DivergenceAnalysis.h"
 #include "llvm/Analysis/DomPrinter.h"
 #include "llvm/Analysis/DominanceFrontier.h"
+#include "llvm/Analysis/ExplorativeLV.h"
 #include "llvm/Analysis/FunctionPropertiesAnalysis.h"
 #include "llvm/Analysis/GlobalsModRef.h"
 #include "llvm/Analysis/IRSimilarityIdentifier.h"
@@ -696,7 +697,8 @@ Expected<SimplifyCFGOptions> parseSimplifyCFGOptions(StringRef Params) {
         return make_error<StringError>(
             formatv("invalid argument to SimplifyCFG pass bonus-threshold "
                     "parameter: '{0}' ",
-                    ParamName).str(),
+                    ParamName)
+                .str(),
             inconvertibleErrorCode());
       Result.bonusInstThreshold(BonusInstThreshold.getSExtValue());
     } else {
@@ -1612,12 +1614,14 @@ Error PassBuilder::parsePassPipeline(ModulePassManager &MPM,
       Pipeline = {{"function", std::move(*Pipeline)}};
     } else if (isLoopNestPassName(FirstName, LoopPipelineParsingCallbacks,
                                   UseMemorySSA)) {
-      Pipeline = {{"function", {{UseMemorySSA ? "loop-mssa" : "loop",
-                                 std::move(*Pipeline)}}}};
+      Pipeline = {
+          {"function",
+           {{UseMemorySSA ? "loop-mssa" : "loop", std::move(*Pipeline)}}}};
     } else if (isLoopPassName(FirstName, LoopPipelineParsingCallbacks,
                               UseMemorySSA)) {
-      Pipeline = {{"function", {{UseMemorySSA ? "loop-mssa" : "loop",
-                                 std::move(*Pipeline)}}}};
+      Pipeline = {
+          {"function",
+           {{UseMemorySSA ? "loop-mssa" : "loop", std::move(*Pipeline)}}}};
     } else {
       for (auto &C : TopLevelPipelineParsingCallbacks)
         if (C(MPM, *Pipeline))

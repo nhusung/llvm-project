@@ -21,9 +21,13 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Transforms/Vectorize/ExplorativeLV.h"
+#include "llvm/ADT/APInt.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/CFG.h"
+#include "llvm/Analysis/ExplorativeLV.h"
 #include "llvm/Analysis/LoopIterator.h"
 #include "llvm/Analysis/ScalarEvolution.h"
+#include "llvm/Analysis/ScalarEvolutionExpressions.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DebugInfo.h"
@@ -31,10 +35,12 @@
 #include "llvm/IR/GlobalValue.h"
 #include "llvm/IR/IRPrintingPasses.h"
 #include "llvm/IR/InstrTypes.h"
+#include "llvm/IR/Instruction.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Value.h"
 #include "llvm/Passes/StandardInstrumentations.h"
+#include "llvm/Support/Casting.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/FileUtilities.h"
@@ -64,6 +70,11 @@ cl::opt<ExplorativeLVPass::Metric> ExplorativeLV(
                clEnumValN(ExplorativeLVPass::Metric::Benchmark, "benchmark",
                           "Benchmark")));
 
+// Used by MachineCodeExplorer
+cl::opt<bool> ExplorePlain("explore-plain", cl::Hidden, cl::init(false),
+                           cl::desc("If loop exploration is enabled, use "
+                                    "entire function for cost calculation"));
+
 } // namespace llvm
 
 static cl::opt<unsigned>
@@ -91,11 +102,6 @@ static cl::opt<unsigned>
                                       "function calls) of the benchmark loop"));
 
 static cl::opt<bool>
-    ExplorePlain("explore-plain", cl::Hidden, cl::init(false),
-                 cl::desc("If loop exploration is enabled, use "
-                          "entire function for cost calculation"));
-
-static cl::opt<bool>
     ExploreDivVF("explore-divide-by-vf", cl::Hidden, cl::init(false),
                  cl::desc("If loop exploration is enabled, aggregate "
                           "the cost results by the VF"));
@@ -114,6 +120,7 @@ namespace {
 class LoopModuleBuilder : public ValueMaterializer {
   const Function &OrigFunc;
   Loop &L;
+  ScalarEvolution &SE;
 
   Module *M = nullptr;
   ValueToValueMapTy VMap;
@@ -129,9 +136,9 @@ class LoopModuleBuilder : public ValueMaterializer {
   void buildFuncTy();
 
 public:
-  LoopModuleBuilder(const Function &OrigFunc, Loop &L,
+  LoopModuleBuilder(const Function &OrigFunc, Loop &L, ScalarEvolution &SE,
                     bool MakeExecutable = false)
-      : OrigFunc(OrigFunc), L(L), Mapper(VMap, RF_None, nullptr, this),
+      : OrigFunc(OrigFunc), L(L), SE(SE), Mapper(VMap, RF_None, nullptr, this),
         MakeExecutable(MakeExecutable){};
   virtual ~LoopModuleBuilder() { delete M; }
 
@@ -162,19 +169,17 @@ bool LoopModuleBuilder::determineIO() {
 
   for (const BasicBlock *BB : L.getBlocks()) {
     for (const Instruction &I : *BB) {
-      if (MakeExecutable) {
-        if (isa<CallBase>(I)) {
-          // Dealing with call instructions is hard.  If they have external
-          // linkage, the linker would probably fail.  One approach would be to
-          // replace them by dummy functions, but for now we refrain from
-          // analyzing these.  Inline assembly is also embedded using call
-          // instructions, we'd have to make these distinctions here.  However,
-          // we allow intrinsics.
-          if (!isa<IntrinsicInst>(I))
-            return false;
+      if (MakeExecutable && isa<CallBase>(I)) {
+        // Dealing with call instructions is hard.  If they have external
+        // linkage, the linker would probably fail.  One approach would be to
+        // replace them by dummy functions, but for now we refrain from
+        // analyzing these.  Inline assembly is also embedded using call
+        // instructions, we'd have to make these distinctions here.  However,
+        // we allow intrinsics.
+        if (!isa<IntrinsicInst>(I))
+          return false;
 
-          // TODO: are there intrinsics we should forbid?
-        }
+        // TODO: are there intrinsics we should forbid?
       }
 
       // Used inside loop and defined outside?
@@ -299,6 +304,12 @@ void LoopModuleBuilder::buildFuncTy() {
 Module *LoopModuleBuilder::getModule() {
   if (M)
     return M;
+
+  if (MakeExecutable &&
+      isa<SCEVCouldNotCompute>(SE.getSymbolicMaxBackedgeTakenCount(&L))) {
+    dbgs() << "Explorative LV: Cannot infer trip count\n";
+    return nullptr;
+  }
 
   if (!determineIO())
     return nullptr;
@@ -704,7 +715,7 @@ static std::string getMainExecutable(const char *Name) {
 // The more complex approach, using the runtime estimation mechanisms
 // already present in LLVM: llvm-mca
 // (To be called from the pass that performs the exploration)
-static unsigned performMCACostCalc(StringRef FileName, StringRef TargetCPU,
+static uint64_t performMCACostCalc(StringRef FileName, StringRef TargetCPU,
                                    StringRef TargetTriple) {
   // Before running the analyser, reduce the code we look at to the actual
   // loop code. The script will try to find a vector loop first, but fall back
@@ -723,7 +734,7 @@ static unsigned performMCACostCalc(StringRef FileName, StringRef TargetCPU,
       sys::findProgramByName("llvm-mca", {getMainExecutable("llvm-mca")});
   if (!MCAExecPath) {
     errs() << "Explorative LV: Could not find llvm-mca executable\n";
-    return UINT_MAX;
+    return ExplorativeLVPass::InvalidCosts;
   }
 
   // Build the most specific command line we can generate from the info in TM
@@ -737,20 +748,20 @@ static unsigned performMCACostCalc(StringRef FileName, StringRef TargetCPU,
            "--resource-pressure=false", "--json", FileName},
           None, {StringRef(""), MCAOutPath.str(), StringRef("")}) != 0) {
     errs() << "Explorative LV: executing llvm-mca failed";
-    return UINT_MAX;
+    return ExplorativeLVPass::InvalidCosts;
   }
 
   // Read JSON
   auto MCAOutBuf = MemoryBuffer::getFile(MCAOutPath);
   if (!MCAOutBuf) {
     errs() << "Explorative LV: could not read llvm-mca output\n";
-    return UINT_MAX;
+    return ExplorativeLVPass::InvalidCosts;
   }
   StringRef MCAOut = MCAOutBuf.get()->getBuffer();
   auto MCAJSON = json::parse(MCAOut);
   if (!MCAJSON) {
     errs() << "Explorative LV: could not parse llvm-mca JSON\n";
-    return UINT_MAX;
+    return ExplorativeLVPass::InvalidCosts;
   }
 
   // Extract CodeRegions[0].SummaryView.TotalCycles from JSON
@@ -773,17 +784,19 @@ static unsigned performMCACostCalc(StringRef FileName, StringRef TargetCPU,
   } while (false);
 
   errs() << "Explorative LV: llvm-mca output is malformed\n";
-  return UINT_MAX;
+  return ExplorativeLVPass::InvalidCosts;
 }
 
 // Add to the given pass manager everything we need to simulate our backend
 // pipeline
 // ~~> EmitAssemblyHelper::AddEmitPasses in clang's BackendUtil
 static void initCodeGen(legacy::PassManager &PM, TargetMachine &TM,
-                        const TargetLibraryInfo &TLI, raw_pwrite_stream &OS,
-                        CodeGenFileType CGFT) {
+                        ExplorativeLVPass *XLV, const TargetLibraryInfo &TLI,
+                        raw_pwrite_stream &OS, CodeGenFileType CGFT) {
   if (ExploreDumpOptModuleIR)
     PM.add(createPrintModulePass(outs()));
+
+  PM.add(new ExplorativeLVHelper(XLV));
 
   // Add LibraryInfo.
   PM.add(new TargetLibraryInfoWrapperPass(TLI));
@@ -809,7 +822,7 @@ struct ExplorativeLVPass::OptPipelineContainer {
   // Inspired by BackendUtil::RunCustomizationPipeline (clang)
   // TODO: customization of SI using command line flags or clang's CodeGenOpts?
   OptPipelineContainer(TargetMachine *TM, PipelineTuningOptions PTO,
-                       Optional<PGOOptions> PGOOpt,
+                       Optional<PGOOptions> PGOOpt, ExplorativeLVPass *XLV,
                        const TargetLibraryInfo &TLI)
       : SI(/* DebugLogging */ false) {
     SI.registerCallbacks(PIC, &FAM);
@@ -817,6 +830,10 @@ struct ExplorativeLVPass::OptPipelineContainer {
     // Create a new PassBuilder which is the basis of a pipeline
     // TODO: I'm not 100% sure that it's wise to use the original TM here
     PassBuilder PB(TM, PTO, PGOOpt, &PIC);
+
+    // Register the target library analysis directly and give it a customized
+    // preset TLI.
+    FAM.registerPass([&] { return ExplorativeLVAnalysis(XLV); });
 
     // Register the target library analysis directly and give it a customized
     // preset TLI.
@@ -853,8 +870,9 @@ struct ExplorativeLVPass::NullCGPipelineContainer {
   raw_null_ostream OS;
   legacy::PassManager PM;
 
-  NullCGPipelineContainer(TargetMachine &TM, const TargetLibraryInfo &TLI) {
-    initCodeGen(PM, TM, TLI, OS, CGFT_Null);
+  NullCGPipelineContainer(TargetMachine &TM, ExplorativeLVPass *XLV,
+                          const TargetLibraryInfo &TLI) {
+    initCodeGen(PM, TM, XLV, TLI, OS, CGFT_Null);
   }
 };
 
@@ -863,85 +881,101 @@ ExplorativeLVPass::~ExplorativeLVPass() {
   delete OptPipeline;
 }
 
+static void updateBestVFIF(unsigned &BestVF, unsigned &BestIF,
+                           uint64_t &MinCosts, unsigned VF, unsigned IF,
+                           uint64_t Costs) {
+  if (Costs == ExplorativeLVPass::InvalidCosts) {
+    LLVM_DEBUG(dbgs() << "Explorative LV: invalid costs for VF " << VF
+                      << ", IF " << IF << "\n");
+    return;
+  }
+
+  if (ExploreDivVF)
+    Costs /= VF;
+
+  LLVM_DEBUG(dbgs() << "Explorative LV: costs for VF " << VF << ", IF " << IF
+                    << ": " << Costs << "\n");
+
+  if (Costs < MinCosts) {
+    MinCosts = Costs;
+    BestVF = VF;
+    BestIF = IF;
+  } else if (Costs == MinCosts && (VF == 1 || VF >= BestVF) && IF >= BestIF) {
+    // If costs are equal to costs retrieved before, always choose the
+    // higher VF-IF combination unless best VF is scalar.
+    BestVF = VF;
+    BestIF = IF;
+  }
+}
+
 // returns whether an error occured
-bool ExplorativeLVPass::processLoop(Function &F, Loop &L,
+bool ExplorativeLVPass::processLoop(Function &F, Loop &L, ScalarEvolution &SE,
                                     TargetLibraryInfo &TLI) {
   assert(OptPipeline && "OptPipeline not initialized");
 
-  LoopModuleBuilder Builder(F, L, ExplorativeLV == Metric::Benchmark);
+  LoopModuleBuilder Builder(F, L, SE, ExplorativeLV == Metric::Benchmark);
   Module *M = Builder.getModule();
   if (!M)
     return true;
 
-  unsigned LowestCostVF = 1;
-  unsigned LowestCostIF = 1;
-  if (ExplorativeLV != Metric::Benchmark) {
-    unsigned LowestCost = UINT_MAX;
+  unsigned BestVF = 1;
+  unsigned BestIF = 1;
+  uint64_t MinCosts = InvalidCosts;
+
+  if (ExplorativeLV == Metric::InstCount) {
+    DenseMap<Function *, EvaluationInfo> ResultMap;
+    EvaluationInfoMap = &ResultMap;
+
+    // Build a module containing functions for all VF/IF combinations
+    for (unsigned VF = 1; VF <= ExploreMaxVF; VF *= 2) {
+      for (unsigned IF = 1; IF <= ExploreMaxIF; IF *= 2) {
+        Function *Func = Builder.buildLoopFunc(VF, IF);
+        ResultMap[Func] = {VF, IF, InvalidCosts};
+      }
+    }
+
+    // Run pipelines
+    OptPipeline->run(*M);
+    NullCGPipeline->PM.run(*M);
+
+    for (auto KV : ResultMap) {
+      EvaluationInfo &Info = KV.getSecond();
+      updateBestVFIF(BestVF, BestIF, MinCosts, Info.VF, Info.IF, Info.Costs);
+    }
+
+    EvaluationInfoMap = nullptr;
+  } else if (ExplorativeLV == Metric::MCA) {
     // Try out which VF works best for this loop
     for (unsigned VF = 1; VF <= ExploreMaxVF; VF *= 2) {
       for (unsigned IF = 1; IF <= ExploreMaxIF; IF *= 2) {
-        Function *LoopFunc = Builder.buildLoopFunc(VF, IF);
+        Builder.buildLoopFunc(VF, IF);
         OptPipeline->run(*M);
 
-        unsigned Result;
         // Expensive, but: If we are using llvm-mca for evaluation, we need
         // a new backend pipeline for each iteration as the print stream is
         // dead after one use
-        if (ExplorativeLV == Metric::MCA) {
-          int ASMFD;
-          SmallString<32> ASMPath;
-          sys::fs::createTemporaryFile("explorative-lv", "s", ASMFD, ASMPath);
-          FileRemover ASMRemover(ASMPath);
-          {
-            raw_fd_ostream OS(ASMFD, true);
-            legacy::PassManager CGPipeline;
-            initCodeGen(CGPipeline, *TM, TLI, OS, CGFT_AssemblyFile);
-            CGPipeline.run(*M);
-          }
-          // Perform the cost calculation after the pipeline is deleted, to
-          // make sure the assembly printer has finished
-          Result = performMCACostCalc(ASMPath, TM->getTargetCPU(),
-                                      M->getTargetTriple());
-        } else {
-          // Set MCInstCount to 1 to tell MCExplorer to only go for loops,
-          // to anything else to have it count all MCInsts in function
-          LoopFunc->getContext().setMCInstCount(ExplorePlain ? 0 : 1);
-          if (VF == 1) {
-            // Tell MachineCodeExplorer that we do not expect to see a
-            // vectorized loop
-            LoopFunc->getContext().setScalarExploration(true);
-          } else {
-            LoopFunc->getContext().setScalarExploration(false);
-          }
-          NullCGPipeline->PM.run(*M);
-          Result = LoopFunc->getContext().getMCInstCount();
+        int ASMFD;
+        SmallString<32> ASMPath;
+        sys::fs::createTemporaryFile("explorative-lv", "s", ASMFD, ASMPath);
+        FileRemover ASMRemover(ASMPath);
+        {
+          raw_fd_ostream OS(ASMFD, true);
+          legacy::PassManager CGPipeline;
+          initCodeGen(CGPipeline, *TM, this, TLI, OS, CGFT_AssemblyFile);
+          CGPipeline.run(*M);
         }
+        // Perform the cost calculation after the pipeline is deleted, to make
+        // sure the assembly printer has finished
+        uint64_t Costs = performMCACostCalc(ASMPath, TM->getTargetCPU(),
+                                            M->getTargetTriple());
+        updateBestVFIF(BestVF, BestIF, MinCosts, VF, IF, Costs);
+
         Builder.clearLoopFuncs();
-
-        if (Result == UINT_MAX) {
-          LLVM_DEBUG(dbgs() << "Explorative LV: Invalid costs for VF " << VF
-                            << ", IF " << IF << "\n");
-          continue;
-        }
-
-        if (ExploreDivVF)
-          Result /= VF;
-
-        LLVM_DEBUG(dbgs() << "Explorative LV: Received result " << Result
-                          << " from cost module for VF " << VF << ", IF " << IF
-                          << "\n");
-
-        if (Result < LowestCost ||
-            (LowestCostVF != 1 && Result == LowestCost)) {
-          // If costs are equal to costs retrieved before, always choose
-          // the higher VF-IF combination unless best VF is scalar
-          LowestCost = Result;
-          LowestCostVF = VF;
-          LowestCostIF = IF;
-        }
       }
     }
   } else {
+    assert(ExplorativeLV == Metric::Benchmark);
+
     // Build a module containing functions for all VF/IF combinations
     for (unsigned VF = 1; VF <= ExploreMaxVF; VF *= 2) {
       for (unsigned IF = 1; IF <= ExploreMaxIF; IF *= 2)
@@ -961,7 +995,7 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L,
     {
       raw_fd_ostream OS(ObjectFD, true);
       legacy::PassManager CGPipeline;
-      initCodeGen(CGPipeline, *TM, TLI, OS, CGFT_ObjectFile);
+      initCodeGen(CGPipeline, *TM, this, TLI, OS, CGFT_ObjectFile);
       CGPipeline.run(*M);
     }
 
@@ -1003,26 +1037,16 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L,
     }
     StringRef BenchRes = BenchResBuf.get()->getBuffer();
 
-    uint64_t LowestCost = UINT64_MAX;
     for (unsigned VF = 1; VF <= ExploreMaxVF; VF *= 2) {
       for (unsigned IF = 1; IF <= ExploreMaxIF; IF *= 2) {
-        uint64_t Result;
-        if (BenchRes.consumeInteger(10, Result)) {
+        uint64_t Costs;
+        if (BenchRes.consumeInteger(10, Costs)) {
           errs() << "Explorative LV: could not read integer";
           return true;
         }
         BenchRes = BenchRes.drop_front(); // drop '\n'
 
-        LLVM_DEBUG(dbgs() << "Explorative LV: costs for VF " << VF << ", IF "
-                          << IF << ": " << Result << "\n");
-        if (Result < LowestCost ||
-            (LowestCostVF != 1 && Result == LowestCost)) {
-          // If costs are equal to costs retrieved before, always choose
-          // the higher VF-IF combination unless best VF is scalar
-          LowestCost = Result;
-          LowestCostVF = VF;
-          LowestCostIF = IF;
-        }
+        updateBestVFIF(BestVF, BestIF, MinCosts, VF, IF, Costs);
       }
     }
   }
@@ -1031,9 +1055,9 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L,
   // cost
   LLVM_DEBUG(
       dbgs() << "Explorative LV: Choosing this VF and IF for vectorization: "
-             << LowestCostVF << " and " << LowestCostIF << "\n");
-  addStringMetadataToLoop(&L, "llvm.loop.vectorize.width", LowestCostVF);
-  addStringMetadataToLoop(&L, "llvm.loop.interleave.count", LowestCostIF);
+             << BestVF << " and " << BestIF << "\n");
+  addStringMetadataToLoop(&L, "llvm.loop.vectorize.width", BestVF);
+  addStringMetadataToLoop(&L, "llvm.loop.interleave.count", BestIF);
 
   return false; // no errors
 }
@@ -1064,6 +1088,11 @@ static void collectSupportedLoops(Loop &L, LoopInfo *LI,
 
 PreservedAnalyses ExplorativeLVPass::run(Function &F,
                                          FunctionAnalysisManager &AM) {
+  ExplorativeLVPass *MainPass = AM.getResult<ExplorativeLVAnalysis>(F).Pass;
+  if (MainPass) { // 'child' pass
+    return PreservedAnalyses::all();
+  }
+
   auto &AC = AM.getResult<AssumptionAnalysis>(F);
   auto &DT = AM.getResult<DominatorTreeAnalysis>(F);
   auto &LI = AM.getResult<LoopAnalysis>(F);
@@ -1089,14 +1118,14 @@ PreservedAnalyses ExplorativeLVPass::run(Function &F,
 
   // Initialize pipeline only if there is something to do.
   if (!OptPipeline)
-    OptPipeline = new OptPipelineContainer(TM, PTO, PGOOpt, TLI);
+    OptPipeline = new OptPipelineContainer(TM, PTO, PGOOpt, this, TLI);
   // If this is a code size evaluation, we can re-use the same backend pipeline.
   if (!NullCGPipeline && ExplorativeLV == Metric::InstCount)
-    NullCGPipeline = new NullCGPipelineContainer(*TM, TLI);
+    NullCGPipeline = new NullCGPipelineContainer(*TM, this, TLI);
 
   do {
     Loop *L = Worklist.pop_back_val();
-    if (processLoop(F, *L, TLI)) {
+    if (processLoop(F, *L, SE, TLI)) {
       LLVM_DEBUG(dbgs() << "Processing loop failed, letting the AutoVectorizer "
                            "determine VF and IF\n");
       addStringMetadataToLoop(L, "llvm.loop.vectorize.width", 0);

@@ -1278,11 +1278,8 @@ void TargetPassConfig::addMachinePasses() {
 
   // Add MachineCodeExplorer pass if we perform explorative vectorization and do
   // not use another metric
-  if (ExplorativeLV == ExplorativeLVPass::Metric::InstCount) {
-    // TODO: It would be more elegant to check that we are in the loop
-    // compilation pipeline but not in the main pipeline.
+  if (ExplorativeLV == ExplorativeLVPass::Metric::InstCount)
     addPass(createMachineCodeExplorer());
-  }
 
   AddingMachinePasses = false;
 }
