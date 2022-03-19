@@ -23,7 +23,7 @@
 #ifndef LLVM_TRANSFORMS_EXPLORATIVELV_H
 #define LLVM_TRANSFORMS_EXPLORATIVELV_H
 
-#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/Passes/PassBuilder.h"
 #include <cassert>
@@ -33,6 +33,15 @@ namespace llvm {
 struct MachineCodeExplorer;
 
 class ExplorativeLVPass : public PassInfoMixin<ExplorativeLVPass> {
+public:
+  class InputBuilder;
+
+  enum class Metric { Disable, InstCount, MCA, Benchmark };
+
+  friend struct MachineCodeExplorer;
+  static const uint64_t InvalidCosts = UINT64_MAX;
+
+private:
   struct OptPipelineContainer;
   struct NullCGPipelineContainer;
 
@@ -51,6 +60,10 @@ class ExplorativeLVPass : public PassInfoMixin<ExplorativeLVPass> {
   bool processLoop(Function &F, Loop &L, ScalarEvolution &SE,
                    TargetLibraryInfo &TLI);
 
+  // For benchmarking mode: It is easier to infer the inputs in the "children"
+  // pipelines.  This is used to pass them back to the "parent" pipeline.
+  InputBuilder *InferredInputs = nullptr;
+
   struct EvaluationInfo {
     unsigned VF;
     unsigned IF;
@@ -67,23 +80,22 @@ public:
   ExplorativeLVPass(TargetMachine *TM, PipelineTuningOptions PTO,
                     Optional<PGOOptions> PGOOpt)
       : TM(TM), PTO(PTO), PGOOpt(PGOOpt) {}
+
   ExplorativeLVPass(ExplorativeLVPass &&Pass)
       : TM(Pass.TM), PTO(Pass.PTO), PGOOpt(Pass.PGOOpt),
         OptPipeline(Pass.OptPipeline), NullCGPipeline(Pass.NullCGPipeline) {
     assert(!EvaluationInfoMap && "EvaluationInfoMap present during move");
+    assert(!InferredInputs && "InferredInputs present during move");
+
     Pass.OptPipeline = nullptr;
     Pass.NullCGPipeline = nullptr;
   }
+
   ExplorativeLVPass(const ExplorativeLVPass &Pass) = delete;
+
   ~ExplorativeLVPass();
 
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
-
-  enum class Metric { Disable, InstCount, MCA, Benchmark };
-
-  static const uint64_t InvalidCosts = UINT64_MAX;
-
-  friend struct MachineCodeExplorer;
 };
 
 } // namespace llvm

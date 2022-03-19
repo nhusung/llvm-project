@@ -33,6 +33,7 @@
 #include "llvm/IR/DebugInfo.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/GlobalValue.h"
+#include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRPrintingPasses.h"
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Instruction.h"
@@ -42,6 +43,7 @@
 #include "llvm/Passes/StandardInstrumentations.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/FileUtilities.h"
 #include "llvm/Support/JSON.h"
@@ -86,6 +88,9 @@ static cl::opt<unsigned>
                  cl::desc("The maximum interleaving factor to use for "
                           "explorative loop vectorization"));
 
+static cl::opt<unsigned> ExploreDesiredTripCount(
+    "explore-desired-tripcount", cl::Hidden, cl::init(1024),
+    cl::desc("In benchmarking mode: try to run the loop with this trip count"));
 static cl::opt<uint64_t>
     ExploreBenchmarkTicks("explore-benchmark-ticks", cl::Hidden,
                           cl::init(CLOCKS_PER_SEC / 10),
@@ -115,6 +120,155 @@ static cl::opt<bool> ExploreDumpOptModuleIR(
     cl::desc("If true, add a PrintModulePass at the beginning of the "
              "explorative codegen pipeline"));
 
+class ExplorativeLVPass::InputBuilder {
+  using ArrayID = unsigned;
+
+  class MemAccessRange {
+    friend class InputBuilder;
+
+    int64_t Start;
+    int64_t End;
+
+    Type *ElementType;
+
+    // We'll use global variables to allocate memory
+    GlobalVariable *GV = nullptr;
+
+  public:
+    MemAccessRange(int64_t Start, int64_t End, Type *ElementType)
+        : Start(Start), End(End), ElementType(ElementType) {}
+  };
+
+  DenseMap<Value *, ConstantInt *> IntInputs;
+  DenseMap<Value *, std::pair<ArrayID, int64_t>> MemAccesses;
+  SmallVector<MemAccessRange> MemRanges;
+
+public:
+  ArrayID addMemAccess(Value *Val, int64_t Start, int64_t End);
+  void addMemAccessForArray(Value *Val, ArrayID Array, int64_t Offset);
+
+  APInt tryAddIntInput(Value *Val, APInt &&Desired);
+
+  void build(Module &M, SmallVectorImpl<Value *> &Args);
+
+  unsigned NumInputArgs = 0;
+};
+using InputBuilder = ExplorativeLVPass::InputBuilder;
+
+InputBuilder::ArrayID InputBuilder::addMemAccess(Value *Val, int64_t Start,
+                                                 int64_t End) {
+  assert(Start <= End && "Start <= End required");
+
+  ArrayID RangeID = MemRanges.size();
+  auto Res = MemAccesses.try_emplace(Val, RangeID, 0);
+  if (Res.second) { // Did emplace
+    // Sanitize the range.  Even if the memory access is in [Start, End], we
+    // also want that the pointer itself is in [Start, End].
+    if (Start > 0)
+      Start = 0;
+    if (End < 0)
+      End = 0;
+
+    MemRanges.emplace_back(Start, End,
+                           Val->getType()->getNonOpaquePointerElementType());
+    return RangeID;
+  }
+
+  RangeID = Res.first->second.first;
+  MemAccessRange &Range = MemRanges[RangeID];
+  if (Start < Range.Start)
+    Range.Start = Start;
+  if (End > Range.End)
+    Range.End = End;
+  return RangeID;
+}
+
+void InputBuilder::addMemAccessForArray(Value *Val, ArrayID Array,
+                                        int64_t Offset) {
+  MemAccessRange &Range = MemRanges[Array];
+  assert(Val->getType()->getNonOpaquePointerElementType() ==
+             Range.ElementType &&
+         "Pointee types must agree");
+  if (Offset < Range.Start) {
+    Range.Start = Offset;
+  } else if (Offset > Range.End) {
+    Range.End = Offset;
+  }
+  MemAccesses.try_emplace(Val, Array, Offset);
+}
+
+APInt InputBuilder::tryAddIntInput(Value *Val, APInt &&Desired) {
+  // Use a dummy pointer first
+  auto Res = IntInputs.try_emplace(Val, nullptr);
+
+  if (!Res.second) // Didn't emplace
+    return Res.first->second->getValue();
+
+  // Now, we need to construct the value
+  Res.first->second = ConstantInt::get(Val->getType()->getContext(), Desired);
+  return Desired;
+}
+
+void InputBuilder::build(Module &M, SmallVectorImpl<Value *> &Args) {
+  assert(NumInputArgs == Args.size() && "NumInputArgs was not properly set");
+
+  for (auto &Input : IntInputs) {
+    Value *Val = Input.first;
+    if (const Argument *Arg = dyn_cast<Argument>(Val)) {
+      assert(Arg->getArgNo() < NumInputArgs &&
+             "Inferring value for output argument?");
+      Args[Arg->getArgNo()] = Input.second;
+      continue;
+    }
+
+    GlobalVariable *GV = cast<GlobalVariable>(Val);
+    if (GV->hasInitializer()) {
+      // TODO: Should we preserve already present initializers?
+      LLVM_DEBUG(dbgs() << "Explorative LV: overwriting initializer "
+                        << *GV->getInitializer() << "\n");
+    }
+    GV->setInitializer(Input.second);
+  }
+
+  DataLayout DL(&M);
+  for (MemAccessRange &Range : MemRanges) {
+    uint64_t Size =
+        (Range.End - Range.Start) / DL.getTypeAllocSize(Range.ElementType) + 1;
+    ArrayType *Ty = ArrayType::get(Range.ElementType, Size);
+    Range.GV = new GlobalVariable(M, Ty, false, GlobalValue::PrivateLinkage,
+                                  ConstantAggregateZero::get(Ty));
+  }
+
+  LLVMContext &C = M.getContext();
+  Type *I64Ty = Type::getInt64Ty(C);
+  Constant *I640 = ConstantInt::get(I64Ty, 0);
+  for (auto &Access : MemAccesses) {
+    Value *Val = Access.first;
+    ArrayID RangeID = Access.second.first;
+    MemAccessRange &Range = MemRanges[RangeID];
+    GlobalVariable *GV = Range.GV;
+    assert(GV);
+    uint64_t Offset = (Access.second.second - Range.Start) /
+                      DL.getTypeAllocSize(Range.ElementType);
+
+    Constant *GEP = ConstantExpr::getInBoundsGetElementPtr(
+        GV->getValueType(), GV,
+        ArrayRef<Constant *>{I640, ConstantInt::get(I64Ty, Offset)});
+
+    if (const Argument *Arg = dyn_cast<Argument>(Val)) {
+      assert(Arg->getArgNo() < Args.size() &&
+             "Inferring value for output argument?");
+      Args[Arg->getArgNo()] = GEP;
+      continue;
+    }
+
+    LLVM_DEBUG(
+        dbgs() << "Explorative LV: ignoring memory access to global (not via "
+                  "argument) - is loop invariant code motion enabled?\n");
+    // TODO: should we handle this case or should we move message?
+  }
+}
+
 namespace {
 
 class LoopModuleBuilder : public ValueMaterializer {
@@ -129,6 +283,8 @@ class LoopModuleBuilder : public ValueMaterializer {
   SmallVector<const Instruction *> Outputs;
   FunctionType *FuncTy;
   SmallVector<Function *> LoopFuncs;
+
+  InputBuilder InferredInputs;
 
   bool MakeExecutable;
 
@@ -155,6 +311,11 @@ public:
       LoopFunc->eraseFromParent();
     }
     LoopFuncs.clear();
+  }
+
+  InputBuilder &getInferredInputsRef() {
+    assert(M && "No loop func has been built yet");
+    return InferredInputs;
   }
 };
 
@@ -207,6 +368,8 @@ bool LoopModuleBuilder::determineIO() {
       }
     }
   }
+
+  InferredInputs.NumInputArgs = Inputs.size();
 
   return true;
 }
@@ -307,7 +470,7 @@ Module *LoopModuleBuilder::getModule() {
 
   if (MakeExecutable &&
       isa<SCEVCouldNotCompute>(SE.getSymbolicMaxBackedgeTakenCount(&L))) {
-    dbgs() << "Explorative LV: Cannot infer trip count\n";
+    LLVM_DEBUG(dbgs() << "Explorative LV: Cannot infer trip count\n");
     return nullptr;
   }
 
@@ -509,7 +672,7 @@ Function *LoopModuleBuilder::buildLoopFunc(unsigned VF, unsigned IF) {
   // outside the loop.
   for (PHINode &P : NewLoopHeader->phis()) {
     for (BasicBlock **It = P.block_begin(), **End = P.block_end(); It != End;
-         It++) {
+         ++It) {
       if (VMap.count(*It) == 0)
         *It = PreHdrBB;
     }
@@ -549,7 +712,7 @@ void LoopModuleBuilder::buildMainFuncBody() {
 
   // Some types and values we will use a few times
   Type *I32Ty = Type::getInt32Ty(C);
-  Type *I64Ty = Type::getInt32Ty(C);
+  Type *I64Ty = Type::getInt64Ty(C);
   Constant *I320 = ConstantInt::get(I32Ty, 0);
   Constant *I321 = ConstantInt::get(I32Ty, 1);
   Constant *I640 = ConstantInt::get(I64Ty, 0);
@@ -599,26 +762,25 @@ void LoopModuleBuilder::buildMainFuncBody() {
   SmallVector<Value *> CArgs;
   /* Create arguments */ {
     assert(Inputs.size() <= LoopFuncTy->getNumParams());
-
     auto *It = LoopFuncTy->param_begin();
-    auto *OutputParamsBegin = It;
-    std::advance(OutputParamsBegin, Inputs.size());
 
     // Create input arguments
-    for (; It != OutputParamsBegin; ++It) {
-      // FIXME: we should use more meaningful values
-      Args.push_back(Constant::getNullValue(*It));
-      CArgs.push_back(Constant::getNullValue(*It));
+    Args.assign(Inputs.size(), nullptr);
+    InferredInputs.build(*M, Args);
+    for (Value *&Arg : Args) {
+      if (!Arg)
+        Arg = Constant::getNullValue(*It);
+      ++It;
     }
+    CArgs = Args;
 
     // Alloc locations for output parameters
     for (auto *End = LoopFuncTy->param_end(); It != End; ++It) {
-      Args.push_back(
-          new AllocaInst(cast<PointerType>(*It)->getPointerElementType(),
-                         BenchFunc->getAddressSpace(), "outarg", StartBB));
-      CArgs.push_back(
-          new AllocaInst(cast<PointerType>(*It)->getPointerElementType(),
-                         CalibFunc->getAddressSpace(), "outarg", CStartBB));
+      Type *ElementType = (*It)->getNonOpaquePointerElementType();
+      Args.push_back(new AllocaInst(ElementType, BenchFunc->getAddressSpace(),
+                                    "outarg", StartBB));
+      CArgs.push_back(new AllocaInst(ElementType, CalibFunc->getAddressSpace(),
+                                     "outarg", CStartBB));
     }
   }
 
@@ -831,8 +993,11 @@ struct ExplorativeLVPass::OptPipelineContainer {
     // TODO: I'm not 100% sure that it's wise to use the original TM here
     PassBuilder PB(TM, PTO, PGOOpt, &PIC);
 
-    // Register the target library analysis directly and give it a customized
-    // preset TLI.
+    // Register the ExplorativeLVAnalysis with the current ExplorativeLVPass.
+    // The optimization pipeline we create will contain a new ExplorativeLVPass
+    // and it should behave different compared to the current ExplorativeLVPass
+    // (i. e. do not clone the loops again, pass inferred arguments back in
+    // benchmarking mode).
     FAM.registerPass([&] { return ExplorativeLVAnalysis(XLV); });
 
     // Register the target library analysis directly and give it a customized
@@ -982,7 +1147,15 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, ScalarEvolution &SE,
         Builder.buildLoopFunc(VF, IF);
     }
 
+    // Get a reference to the inferred inputs vector.  The ExplorativeLVPass in
+    // the optimization pipeline will (try to) infer the arguments.
+    InferredInputs = &Builder.getInferredInputsRef();
+
     OptPipeline->run(*M);
+
+    // The arguments should be inferred exactly once.  To achieve this,
+    // InferredInputs is cleared.
+    assert(!InferredInputs && "Arguments have not been inferred");
 
     // Build the main function -- no need to optimize it
     Builder.buildMainFuncBody();
@@ -1018,8 +1191,8 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, ScalarEvolution &SE,
     unsigned TimeoutS =
         1 + ((Builder.getNumLoopFuncs() + 1) * ExploreBenchmarkTicks) /
                 CLOCKS_PER_SEC;
-    dbgs() << "Explorative LV: Benchmarking for up to " << TimeoutS
-           << " s ...\n";
+    LLVM_DEBUG(dbgs() << "Explorative LV: Benchmarking for up to " << TimeoutS
+                      << " s ...\n");
     SmallString<32> BenchResPath;
     sys::fs::createTemporaryFile("explorative-lv-out", "txt", BenchResPath);
     FileRemover BenchResRemover(BenchResPath);
@@ -1054,7 +1227,7 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, ScalarEvolution &SE,
   // Force the vectorizer to use the VF and IF that showed to have the lowest
   // cost
   LLVM_DEBUG(
-      dbgs() << "Explorative LV: Choosing this VF and IF for vectorization: "
+      dbgs() << "Explorative LV: choosing this VF and IF for vectorization: "
              << BestVF << " and " << BestIF << "\n");
   addStringMetadataToLoop(&L, "llvm.loop.vectorize.width", BestVF);
   addStringMetadataToLoop(&L, "llvm.loop.interleave.count", BestIF);
@@ -1070,7 +1243,7 @@ static void collectSupportedLoops(Loop &L, LoopInfo *LI,
       return;
 
     if (findStringMetadataForLoop(&L, "llvm.loop.vectorize.width")) {
-      LLVM_DEBUG(dbgs() << "Explorative LV: Loop already has user annotation, "
+      LLVM_DEBUG(dbgs() << "Explorative LV: loop already has user annotation, "
                            "skipping exploration\n");
       return;
     }
@@ -1086,17 +1259,508 @@ static void collectSupportedLoops(Loop &L, LoopInfo *LI,
     collectSupportedLoops(*InnerL, LI, V);
 }
 
+namespace {
+
+/// This visitor is slightly specialized compared to SCEVVisitor.  It always
+/// computes an Optional<APInt> and already handles SCEVMinMaxExprs as well as
+/// SCEVSequentialMinMaxExprs.
+template <typename SC, typename... ArgVals> class SCEVCompVisitor {
+  /// Fold an n-ary expression with the accumulator initialized to the
+  /// "visited" first operand.  The folding function takes a reference to the
+  /// accumulator as the first argument and the "new" value as second argument.
+  template <typename FuncT>
+  Optional<APInt> foldNAry(const SCEVNAryExpr *Expr, FuncT Func,
+                           ArgVals... Args) {
+    const auto *It = Expr->op_begin(), *End = Expr->op_end();
+    assert(It != End && "Expected at least one operand");
+    Optional<APInt> Res = visit(*It, Args...);
+    if (!Res)
+      return None;
+    for (++It; It != End; ++It) {
+      Optional<APInt> Tmp = visit(*It, Args...);
+      if (!Tmp)
+        return None;
+      Func(*Res, std::move(*Tmp));
+    }
+    return Res;
+  }
+
+public:
+  Optional<APInt> visit(const SCEV *S, ArgVals... Args) {
+    switch (S->getSCEVType()) {
+    case scConstant:
+      return ((SC *)this)->visitConstant((const SCEVConstant *)S, Args...);
+    case scPtrToInt:
+      return ((SC *)this)
+          ->visitPtrToIntExpr((const SCEVPtrToIntExpr *)S, Args...);
+    case scTruncate:
+      return ((SC *)this)
+          ->visitTruncateExpr((const SCEVTruncateExpr *)S, Args...);
+    case scZeroExtend:
+      return ((SC *)this)
+          ->visitZeroExtendExpr((const SCEVZeroExtendExpr *)S, Args...);
+    case scSignExtend:
+      return ((SC *)this)
+          ->visitSignExtendExpr((const SCEVSignExtendExpr *)S, Args...);
+    case scAddExpr:
+      return ((SC *)this)->visitAddExpr((const SCEVAddExpr *)S, Args...);
+    case scMulExpr:
+      return ((SC *)this)->visitMulExpr((const SCEVMulExpr *)S, Args...);
+    case scUDivExpr:
+      return ((SC *)this)->visitUDivExpr((const SCEVUDivExpr *)S, Args...);
+    case scAddRecExpr:
+      return ((SC *)this)->visitAddRecExpr((const SCEVAddRecExpr *)S, Args...);
+    case scSMaxExpr:
+      return foldNAry((const SCEVNAryExpr *)S,
+                      [](APInt &Acc, APInt &&Sub) {
+                        if (Sub.sgt(Acc))
+                          Acc = std::move(Sub);
+                      },
+                      Args...);
+    case scUMaxExpr:
+      return foldNAry((const SCEVNAryExpr *)S,
+                      [](APInt &Acc, APInt &&Sub) {
+                        if (Sub.sgt(Acc))
+                          Acc = std::move(Sub);
+                      },
+                      Args...);
+    case scSMinExpr:
+      return foldNAry((const SCEVNAryExpr *)S,
+                      [](APInt &Acc, APInt &&Sub) {
+                        if (Sub.sgt(Acc))
+                          Acc = std::move(Sub);
+                      },
+                      Args...);
+    case scUMinExpr:
+    case scSequentialUMinExpr:
+      return foldNAry((const SCEVNAryExpr *)S,
+                      [](APInt &Acc, APInt &&Sub) {
+                        if (Sub.sgt(Acc))
+                          Acc = std::move(Sub);
+                      },
+                      Args...);
+    case scUnknown:
+      return ((SC *)this)->visitUnknown((const SCEVUnknown *)S, Args...);
+    case scCouldNotCompute:
+      return None;
+    }
+    llvm_unreachable("Unknown SCEV kind!");
+  }
+};
+
+class SCEVBackedgeTakenAnalyzer
+    : private SCEVCompVisitor<SCEVBackedgeTakenAnalyzer, APInt> {
+  friend class SCEVCompVisitor<SCEVBackedgeTakenAnalyzer, APInt>;
+
+  ScalarEvolution &SE;
+  InputBuilder &Inferred;
+
+  /// Start pointer value
+  ///
+  /// Currently, we only permit a single combination of a start and an end
+  /// pointer to determine the trip count.
+  Value *InferredPtrStart = nullptr;
+
+  /// End pointer value
+  Value *InferredPtrEnd = nullptr;
+
+  /// Difference between Start and End pointer (if present)
+  uint64_t InferredPtrDiff;
+
+  SCEVBackedgeTakenAnalyzer(ScalarEvolution &SE, InputBuilder &InferredInputs)
+      : SE(SE), Inferred(InferredInputs) {}
+
+  Optional<APInt> visitConstant(const SCEVConstant *Constant, APInt) {
+    return Constant->getAPInt();
+  }
+
+  Optional<APInt> visitPtrToIntExpr(const SCEVPtrToIntExpr *Expr,
+                                    APInt Desired) {
+    const SCEV *Sub = Expr->getOperand();
+    unsigned Bits = SE.getTypeSizeInBits(Expr->getType());
+    unsigned SubBits = SE.getTypeSizeInBits(Sub->getType());
+    return visit(Sub, Desired.zextOrTrunc(SubBits)).map([Bits](APInt &&Res) {
+      return Res.zextOrTrunc(Bits);
+    });
+  }
+  Optional<APInt> visitTruncateExpr(const SCEVTruncateExpr *Expr,
+                                    APInt Desired) {
+    const SCEV *Sub = Expr->getOperand();
+    unsigned Bits = SE.getTypeSizeInBits(Expr->getType());
+    unsigned SubBits = SE.getTypeSizeInBits(Sub->getType());
+    return visit(Sub, Desired.zext(SubBits)).map([Bits](APInt &&Res) {
+      return Res.trunc(Bits);
+    });
+  }
+  Optional<APInt> visitZeroExtendExpr(const SCEVZeroExtendExpr *Expr,
+                                      APInt Desired) {
+    const SCEV *Sub = Expr->getOperand();
+    unsigned Bits = SE.getTypeSizeInBits(Expr->getType());
+    unsigned SubBits = SE.getTypeSizeInBits(Sub->getType());
+    return visit(Sub, Desired.trunc(SubBits)).map([Bits](APInt &&Res) {
+      return Res.zext(Bits);
+    });
+  }
+  Optional<APInt> visitSignExtendExpr(const SCEVSignExtendExpr *Expr,
+                                      APInt Desired) {
+    const SCEV *Sub = Expr->getOperand();
+    unsigned Bits = SE.getTypeSizeInBits(Expr->getType());
+    unsigned SubBits = SE.getTypeSizeInBits(Sub->getType());
+    return visit(Sub, Desired.trunc(SubBits)).map([Bits](APInt &&Res) {
+      return Res.sext(Bits);
+    });
+  }
+
+  Optional<APInt> visitAddExpr(const SCEVAddExpr *Expr, APInt Desired) {
+    APInt Res(SE.getTypeSizeInBits(Expr->getType()), 0);
+
+    // Handle constant operands first
+    for (const SCEV *Sub : Expr->operands()) {
+      if (const SCEVConstant *Const = dyn_cast<SCEVConstant>(Sub))
+        Res += Const->getAPInt();
+    }
+    Desired -= Res;
+
+    for (const SCEV *Sub : Expr->operands()) {
+      if (isa<SCEVConstant>(Sub))
+        continue;
+
+      // We hope that there is just one unknown in a "positive" position.
+      // Otherwise we end up with more iterations than desired, but this should
+      // not be too bad either.
+      Optional<APInt> SubRes = visit(Sub, Desired);
+      if (!SubRes)
+        return None;
+      Res += *SubRes;
+    }
+
+    return Res;
+  }
+
+  /// desired = c * x <=> x = desired /u c
+  /// desired = -c * x '<=>' x = 0
+  Optional<APInt> visitMulExpr(const SCEVMulExpr *Expr, APInt Desired) {
+    uint64_t Bits = SE.getTypeSizeInBits(Expr->getType());
+    APInt Res(Bits, 1);
+
+    // Handle constant operands first
+    for (const SCEV *Sub : Expr->operands()) {
+      if (const SCEVConstant *Const = dyn_cast<SCEVConstant>(Sub))
+        Res *= Const->getAPInt();
+    }
+
+    // If this is a "negative" position the desired value is 0.
+    Desired = Res.isNegative() ? APInt(Bits, 0) : Desired.udiv(Res);
+    for (const SCEV *Sub : Expr->operands()) {
+      if (isa<SCEVConstant>(Sub))
+        continue;
+
+      // We hope that there is just one unknown in a "positive" position.
+      // Otherwise we end up with more iterations than desired, but this should
+      // not be too bad either.
+      Optional<APInt> SubRes = visit(Sub, Desired);
+      if (!SubRes)
+        return None;
+      Res *= *SubRes;
+    }
+
+    return Res;
+  }
+
+  /// desired = dividend /u divisor <=> dividend = desired * divisor
+  Optional<APInt> visitUDivExpr(const SCEVUDivExpr *Expr, APInt Desired) {
+    APInt MyDesired = std::move(Desired);
+    Desired = APInt(SE.getTypeSizeInBits(Expr->getType()), 1);
+    Optional<APInt> DivisorRes = visit(Expr->getRHS(), Desired);
+    if (!DivisorRes)
+      return None;
+
+    Desired = MyDesired * *DivisorRes;
+    Optional<APInt> DividendRes = visit(Expr->getLHS(), Desired);
+    if (!DividendRes)
+      return None;
+
+    Desired = std::move(MyDesired);
+    return DividendRes->udiv(*DivisorRes);
+  }
+
+  Optional<APInt> visitAddRecExpr(const SCEVAddRecExpr *, APInt) {
+    // We should not encounter a SCEVAddRecExpr as the extracted loop is the
+    // outermost loop
+    return None;
+  }
+
+  Optional<APInt> visitUnknown(const SCEVUnknown *Unknown, APInt Desired) {
+    Value *Val = Unknown->getValue();
+    Type *Ty = Val->getType();
+
+    if (Ty->isIntegerTy())
+      return Inferred.tryAddIntInput(Val, std::move(Desired));
+
+    assert(Ty->isPointerTy() &&
+           "SCEV analysis deals with integer and pointer types only?");
+
+    if (Desired.isZero()) {
+      if (!InferredPtrStart) {
+        InferredPtrStart = Val;
+        return Desired;
+      }
+      if (InferredPtrStart == Val)
+        return Desired;
+    } else {
+      if (!InferredPtrEnd) {
+        InferredPtrEnd = Val;
+        InferredPtrDiff = Desired.getZExtValue();
+        return Desired;
+      }
+      if (InferredPtrEnd == Val)
+        return Desired;
+    }
+
+    // There is already another start or end pointer set.  We cannot deal with
+    // this.
+    return None;
+  }
+
+public:
+  static Optional<APInt> analyze(ScalarEvolution &SE, const SCEV *Expr,
+                                 InputBuilder &Inferred,
+                                 unsigned DesiredBackedgeTaken) {
+    if (isa<SCEVCouldNotCompute>(Expr))
+      return None; // else Expr->getType() will fail
+
+    SCEVBackedgeTakenAnalyzer Analyzer(SE, Inferred);
+    Optional<APInt> Res =
+        Analyzer.visit(Expr, APInt(SE.getTypeSizeInBits(Expr->getType()),
+                                   DesiredBackedgeTaken));
+    if (Analyzer.InferredPtrStart && Analyzer.InferredPtrEnd) {
+      // One less than InferredPtrDiff would be enough, since the range is
+      // inclusive.  However, we'd also need to change addMemAccessForArray such
+      // that the element is not allocated there ...
+      auto Array = Inferred.addMemAccess(Analyzer.InferredPtrStart, 0,
+                                         Analyzer.InferredPtrDiff);
+      Inferred.addMemAccessForArray(Analyzer.InferredPtrEnd, Array,
+                                    Analyzer.InferredPtrDiff);
+    }
+    return Res;
+  }
+};
+
+class SCEVMemAccessAnalyzer : private SCEVCompVisitor<SCEVMemAccessAnalyzer> {
+  friend class SCEVCompVisitor<SCEVMemAccessAnalyzer>;
+
+  ScalarEvolution &SE;
+  InputBuilder &Inferred;
+  const SCEV *ItStart;
+  const SCEV *ItEnd;
+
+  Value *BasePointer = nullptr;
+
+  Optional<APInt> visitConstant(const SCEVConstant *Constant) {
+    return Constant->getAPInt();
+  }
+
+  Optional<APInt> visitPtrToIntExpr(const SCEVPtrToIntExpr *Expr) {
+    const SCEV *Sub = Expr->getOperand();
+    unsigned Bits = SE.getTypeSizeInBits(Expr->getType());
+    return visit(Sub).map(
+        [Bits](APInt &&Res) { return Res.zextOrTrunc(Bits); });
+  }
+  Optional<APInt> visitTruncateExpr(const SCEVTruncateExpr *Expr) {
+    const SCEV *Sub = Expr->getOperand();
+    unsigned Bits = SE.getTypeSizeInBits(Expr->getType());
+    return visit(Sub).map([Bits](APInt &&Res) { return Res.trunc(Bits); });
+  }
+  Optional<APInt> visitZeroExtendExpr(const SCEVZeroExtendExpr *Expr) {
+    const SCEV *Sub = Expr->getOperand();
+    unsigned Bits = SE.getTypeSizeInBits(Expr->getType());
+    return visit(Sub).map([Bits](APInt &&Res) { return Res.zext(Bits); });
+  }
+  Optional<APInt> visitSignExtendExpr(const SCEVSignExtendExpr *Expr) {
+    const SCEV *Sub = Expr->getOperand();
+    unsigned Bits = SE.getTypeSizeInBits(Expr->getType());
+    return visit(Sub).map([Bits](APInt &&Res) { return Res.sext(Bits); });
+  }
+
+  Optional<APInt> visitAddExpr(const SCEVAddExpr *Expr) {
+    APInt Res(SE.getTypeSizeInBits(Expr->getType()), 0);
+    for (const SCEV *Sub : Expr->operands()) {
+      Optional<APInt> SubRes = visit(Sub);
+      if (!SubRes)
+        return None;
+      Res += *SubRes;
+    }
+    return Res;
+  }
+  Optional<APInt> visitMulExpr(const SCEVMulExpr *Expr) {
+    APInt Res(SE.getTypeSizeInBits(Expr->getType()), 1);
+    for (const SCEV *Sub : Expr->operands()) {
+      Optional<APInt> SubRes = visit(Sub);
+      if (!SubRes)
+        return None;
+      Res *= *SubRes;
+    }
+    return Res;
+  }
+  Optional<APInt> visitUDivExpr(const SCEVUDivExpr *Expr) {
+    Optional<APInt> DivisorRes = visit(Expr->getRHS());
+    if (!DivisorRes)
+      return None;
+    return visit(Expr->getLHS()).map([&DivisorRes](APInt &&DividendRes) {
+      return DividendRes.udiv(*DivisorRes);
+    });
+  }
+
+  /// AddRec is (usually?) the outermost expression, so this is a no-op.
+  Optional<APInt> visitAddRecExpr(const SCEVAddRecExpr *Expr) {
+    LLVM_DEBUG(dbgs() << "Explorative LV: found an inner SCEVAddRecExpr when "
+                         "analyzing memory accesses\n");
+    return None;
+  }
+
+  Optional<APInt> visitUnknown(const SCEVUnknown *Unknown) {
+    Value *Val = Unknown->getValue();
+    if (!isa<Argument>(Val) && !isa<GlobalVariable>(Val))
+      return None;
+
+    Type *Ty = Val->getType();
+
+    if (IntegerType *IntTy = dyn_cast<IntegerType>(Ty))
+      return Inferred.tryAddIntInput(Val, APInt(IntTy->getBitWidth(), 1));
+
+    assert(Ty->isPointerTy() &&
+           "SCEV analysis deals with integer and pointer types only?");
+
+    if (BasePointer != Val) {
+      if (BasePointer) {
+        LLVM_DEBUG(dbgs() << "Explorative LV: found two base pointers when "
+                             "analyzing memory accesses\n");
+        return None;
+      }
+
+      BasePointer = Val;
+    }
+
+    // We calculate accesses relative to the pointer
+    return APInt(SE.getTypeSizeInBits(Ty), 0);
+  }
+
+  Optional<APInt> visitCouldNotCompute(const SCEVCouldNotCompute *) {
+    return None;
+  }
+
+public:
+  SCEVMemAccessAnalyzer(ScalarEvolution &SE, InputBuilder &InferredInputs,
+                        const SCEV *ItStart, const SCEV *ItEnd)
+      : SE(SE), Inferred(InferredInputs), ItStart(ItStart), ItEnd(ItEnd) {}
+
+  void analyze(const SCEV *Expr) {
+    BasePointer = nullptr;
+    if (const SCEVAddRecExpr *AddRec = dyn_cast<SCEVAddRecExpr>(Expr)) {
+      if (AddRec->isAffine()) {
+        Optional<APInt> StartRes =
+            visit(AddRec->evaluateAtIteration(ItStart, SE));
+        if (!StartRes)
+          return;
+        Optional<APInt> EndRes = visit(AddRec->evaluateAtIteration(ItEnd, SE));
+        if (!EndRes)
+          return;
+        if (BasePointer) {
+          int64_t Start = StartRes->getSExtValue();
+          int64_t End = EndRes->getSExtValue();
+          if (Start > End)
+            std::swap(Start, End);
+          Inferred.addMemAccess(BasePointer, Start, End);
+        }
+      } else {
+        // TODO: handle this
+        dbgs() << "Got non-affine memory access: " << *Expr << "\n";
+      }
+    } else {
+      Optional<APInt> Res = visit(Expr);
+      if (!Res)
+        return;
+      int64_t Loc = Res->getSExtValue();
+      if (BasePointer)
+        Inferred.addMemAccess(BasePointer, Loc, Loc);
+    }
+  }
+};
+
+} // end anonymous namespace
+
+static void inferInputs(const Function &F, Loop &L, ScalarEvolution &SE,
+                        ExplorativeLVPass::InputBuilder &InferredInputs) {
+  // Obtain/choose a trip count
+  const SCEV *MaxBackedgeTakenCount = SE.getSymbolicMaxBackedgeTakenCount(&L);
+  LLVM_DEBUG(dbgs() << "Explorative LV: backedge taken count is "
+                    << *MaxBackedgeTakenCount << "\n");
+  Optional<APInt> BTRes = SCEVBackedgeTakenAnalyzer::analyze(
+      SE, MaxBackedgeTakenCount, InferredInputs, ExploreDesiredTripCount - 1);
+  if (!BTRes) {
+    LLVM_DEBUG(
+        dbgs() << "Explorative LV: could not obtain/choose a trip count\n");
+    return;
+  }
+  const SCEV *ItStart = SE.getConstant(APInt(BTRes->getBitWidth(), 0));
+  const SCEV *ItEnd = SE.getConstant(*BTRes);
+  SCEVMemAccessAnalyzer MAAnalyzer(SE, InferredInputs, ItStart, ItEnd);
+
+  // Look at all load an store instructions and determine memory to allocate
+  for (const BasicBlock &BB : F) {
+    for (const Instruction &I : BB) {
+      const Value *Loc;
+      if (const LoadInst *LI = dyn_cast<LoadInst>(&I)) {
+        Loc = LI->getPointerOperand();
+      } else if (const StoreInst *SI = dyn_cast<StoreInst>(&I)) {
+        Loc = SI->getPointerOperand();
+
+        // ignore output params
+        if (const Argument *Arg = dyn_cast<Argument>(Loc)) {
+          if (Arg->getArgNo() >= InferredInputs.NumInputArgs)
+            continue;
+        }
+      } else {
+        continue;
+      }
+
+      const SCEV *LocSCEV = SE.getSCEV(const_cast<Value *>(Loc));
+      LLVM_DEBUG(dbgs() << "Explorative LV: Memory access at " << *LocSCEV
+                        << "\n");
+      MAAnalyzer.analyze(LocSCEV);
+    }
+  }
+}
+
 PreservedAnalyses ExplorativeLVPass::run(Function &F,
                                          FunctionAnalysisManager &AM) {
   ExplorativeLVPass *MainPass = AM.getResult<ExplorativeLVAnalysis>(F).Pass;
-  if (MainPass) { // 'child' pass
+  auto &LI = AM.getResult<LoopAnalysis>(F);
+  auto &SE = AM.getResult<ScalarEvolutionAnalysis>(F);
+
+  if (MainPass) { // "child" pass
+    if (MainPass->InferredInputs) {
+      auto LoopIt = LI.begin();
+      if (LoopIt + 1 != LI.end()) {
+        LLVM_DEBUG(
+            dbgs()
+            << "Explorative LV: Expected exactly one loop in loop function "
+            << F.getName() << "\n");
+        return PreservedAnalyses::all();
+      }
+      inferInputs(F, **LoopIt, SE, *MainPass->InferredInputs);
+
+      // The inputs should be inferred once only and not for every VF-IF
+      // combination.
+      MainPass->InferredInputs = nullptr;
+    }
     return PreservedAnalyses::all();
   }
 
+  // Further analyses needed to run simplifyLoop()
   auto &AC = AM.getResult<AssumptionAnalysis>(F);
   auto &DT = AM.getResult<DominatorTreeAnalysis>(F);
-  auto &LI = AM.getResult<LoopAnalysis>(F);
-  auto &SE = AM.getResult<ScalarEvolutionAnalysis>(F);
+  // Needed to properly "clone" the pipelines
   auto &TLI = AM.getResult<TargetLibraryAnalysis>(F);
 
   // ~~> LoopVectorize::runImpl
