@@ -787,9 +787,11 @@ void LoopModuleBuilder::buildMainFuncBody() {
     }
   }
 
-  // Warmup (benchmarking only)
-  for (unsigned I = 0; I < XLVBenchmarkWarmup; ++I)
+  // Warmup
+  for (unsigned I = 0; I < XLVBenchmarkWarmup; ++I) {
     CallInst::Create(LoopFuncTy, FuncArg, Args, "", StartBB);
+    CallInst::Create(LoopFuncTy, CFuncArg, CArgs, "", CStartBB);
+  }
 
   // Start measuring
   CallInst *TStart = CallInst::Create(ClockFuncTy, ClockFunc, "ts", StartBB);
@@ -811,8 +813,8 @@ void LoopModuleBuilder::buildMainFuncBody() {
     CallInst::Create(LoopFuncTy, CFuncArg, CArgs, "", CLoopBB);
   }
 
-  // Counters and continue/exit conditions
-  ICmpInst *ContLoop = new ICmpInst(*LoopBB, CmpInst::ICMP_ULT, CountPhi, NArg);
+  // Counters and exit conditions
+  ICmpInst *ContLoop = new ICmpInst(*LoopBB, CmpInst::ICMP_EQ, CountPhi, NArg);
   BinaryOperator *CountAdd =
       BinaryOperator::CreateAdd(CountPhi, I321, "counter_next", LoopBB);
 
@@ -827,7 +829,7 @@ void LoopModuleBuilder::buildMainFuncBody() {
 
   // Branch at the end of the loop
   BasicBlock *EvalBB = BasicBlock::Create(C, "bench_eval", BenchFunc);
-  BranchInst::Create(LoopBB, EvalBB, ContLoop, LoopBB);
+  BranchInst::Create(EvalBB, LoopBB, ContLoop, LoopBB);
   CountPhi->addIncoming(CountAdd, LoopBB);
 
   BasicBlock *CRetBB = BasicBlock::Create(C, "calib_ret", CalibFunc);
