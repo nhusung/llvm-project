@@ -1185,19 +1185,26 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, ScalarEvolution &SE,
 
     // Do the benchmarking
     unsigned TimeoutS =
-        1 +
-        ((Builder.getNumLoopFuncs() + 1) * XLVBenchmarkTicks) / CLOCKS_PER_SEC;
+        1 + 2 * ((Builder.getNumLoopFuncs() + 1) * XLVBenchmarkTicks) /
+                CLOCKS_PER_SEC; // ceil(2 * (calib_secs + n * bench_secs))
     LLVM_DEBUG(dbgs() << "XLV: benchmarking for up to " << TimeoutS
                       << " s ...\n");
     SmallString<32> BenchResPath;
     sys::fs::createTemporaryFile("explorative-lv-out", "txt", BenchResPath);
-    FileRemover BenchResRemover(BenchResPath);
-    if (sys::ExecuteAndWait(ExecPath, {"explorative-lv"}, None,
-                            {StringRef(""), BenchResPath.str(), StringRef("")},
-                            TimeoutS) != 0) {
-      errs() << "XLV: benchmarking failed\n";
+    int RetCode = sys::ExecuteAndWait(
+        ExecPath, {"explorative-lv"}, None,
+        {StringRef(""), BenchResPath.str(), StringRef("")}, TimeoutS);
+    if (RetCode == -2) {
+      errs()
+          << "XLV: benchmarking failed/timed out.  You can find the binary at "
+          << BenchResPath << "\n";
       return true;
     }
+    if (RetCode == -1) {
+      errs() << "XLV: failed to execute " << BenchResPath << "\n";
+      return true;
+    }
+    FileRemover BenchResRemover(BenchResPath);
 
     auto BenchResBuf = MemoryBuffer::getFile(BenchResPath);
     if (!BenchResBuf) {
