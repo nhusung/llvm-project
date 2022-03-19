@@ -1191,20 +1191,22 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, ScalarEvolution &SE,
                       << " s ...\n");
     SmallString<32> BenchResPath;
     sys::fs::createTemporaryFile("explorative-lv-out", "txt", BenchResPath);
+    FileRemover BenchResRemover(BenchResPath);
     int RetCode = sys::ExecuteAndWait(
         ExecPath, {"explorative-lv"}, None,
         {StringRef(""), BenchResPath.str(), StringRef("")}, TimeoutS);
     if (RetCode == -2) {
       errs()
           << "XLV: benchmarking failed/timed out.  You can find the binary at "
-          << BenchResPath << "\n";
+          << ExecPath << "\n";
+      ExecRemover.releaseFile();
       return true;
     }
     if (RetCode == -1) {
-      errs() << "XLV: failed to execute " << BenchResPath << "\n";
+      errs() << "XLV: failed to execute " << ExecPath << "\n";
+      ExecRemover.releaseFile();
       return true;
     }
-    FileRemover BenchResRemover(BenchResPath);
 
     auto BenchResBuf = MemoryBuffer::getFile(BenchResPath);
     if (!BenchResBuf) {
