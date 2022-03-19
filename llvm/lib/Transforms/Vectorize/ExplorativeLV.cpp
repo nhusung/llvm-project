@@ -58,8 +58,8 @@ using namespace llvm;
 
 namespace llvm {
 
-cl::opt<ExplorativeLVPass::Metric> ExplorativeLV(
-    "explorative-lv", cl::Hidden,
+cl::opt<ExplorativeLVPass::Metric> XLVMetric(
+    "xlv-metric", cl::Hidden,
     cl::desc(
         "Which metric to use for machine code evaluation in loop exploration"),
     cl::init(ExplorativeLVPass::Metric::Disable),
@@ -73,52 +73,51 @@ cl::opt<ExplorativeLVPass::Metric> ExplorativeLV(
                           "Benchmark")));
 
 // Used by MachineCodeExplorer
-cl::opt<bool> ExplorePlain("explore-plain", cl::Hidden, cl::init(false),
-                           cl::desc("If loop exploration is enabled, use "
-                                    "entire function for cost calculation"));
+cl::opt<bool> XLVPlain("xlv-plain", cl::Hidden, cl::init(false),
+                       cl::desc("If loop exploration is enabled, use "
+                                "entire function for cost calculation"));
 
 } // namespace llvm
 
 static cl::opt<unsigned>
-    ExploreMaxVF("explore-max-vf", cl::Hidden, cl::init(16),
-                 cl::desc("The maximum vectorization factor to use for "
-                          "explorative loop vectorization"));
+    XLVMaxVF("xlv-max-vf", cl::Hidden, cl::init(16),
+             cl::desc("The maximum vectorization factor to use for "
+                      "explorative loop vectorization"));
 static cl::opt<unsigned>
-    ExploreMaxIF("explore-max-if", cl::Hidden, cl::init(8),
-                 cl::desc("The maximum interleaving factor to use for "
-                          "explorative loop vectorization"));
+    XLVMaxIF("xlv-max-if", cl::Hidden, cl::init(8),
+             cl::desc("The maximum interleaving factor to use for "
+                      "explorative loop vectorization"));
 
-static cl::opt<unsigned> ExploreDesiredTripCount(
-    "explore-desired-tripcount", cl::Hidden, cl::init(1024),
+static cl::opt<unsigned> XLVDesiredTripCount(
+    "xlv-desired-tripcount", cl::Hidden, cl::init(1024),
     cl::desc("In benchmarking mode: try to run the loop with this trip count"));
 static cl::opt<uint64_t>
-    ExploreBenchmarkTicks("explore-benchmark-ticks", cl::Hidden,
-                          cl::init(CLOCKS_PER_SEC / 10),
-                          cl::desc("In benchmarking mode: use this number of "
-                                   "clock ticks for calibration"));
-static cl::opt<unsigned> ExploreBenchmarkWarmup(
-    "explore-benchmark-warmup", cl::Hidden, cl::init(16),
+    XLVBenchmarkTicks("xlv-benchmark-ticks", cl::Hidden,
+                      cl::init(CLOCKS_PER_SEC / 10),
+                      cl::desc("In benchmarking mode: use this number of "
+                               "clock ticks for calibration"));
+static cl::opt<unsigned> XLVBenchmarkWarmup(
+    "xlv-benchmark-warmup", cl::Hidden, cl::init(16),
     cl::desc("In benchmarking mode: how many times to call each loop function "
              "before benchmarking"));
 static cl::opt<unsigned>
-    ExploreBenchmarkLoopSize("explore-benchmark-loop-size", cl::Hidden,
-                             cl::init(32),
-                             cl::desc("In benchmarking mode: size (loop "
-                                      "function calls) of the benchmark loop"));
+    XLVBenchmarkLoopSize("xlv-benchmark-loop-size", cl::Hidden, cl::init(32),
+                         cl::desc("In benchmarking mode: size (loop "
+                                  "function calls) of the benchmark loop"));
 
 static cl::opt<bool>
-    ExploreDivVF("explore-divide-by-vf", cl::Hidden, cl::init(false),
-                 cl::desc("If loop exploration is enabled, aggregate "
-                          "the cost results by the VF"));
+    XLVDivVF("xlv-divide-by-vf", cl::Hidden, cl::init(false),
+             cl::desc("If loop exploration is enabled, aggregate "
+                      "the cost results by the VF"));
 
-static cl::opt<bool> ExploreDumpModuleIR(
-    "explore-dump-module-ir", cl::Hidden, cl::init(false),
+static cl::opt<bool>
+    XLVDumpFuncIR("xlv-dump-func-ir", cl::Hidden, cl::init(false),
+                  cl::desc("If true, print the loop function used for "
+                           "explorative vectorization to stderr"));
+static cl::opt<bool> XLVDumpModuleIR(
+    "xlv-dump-module-ir", cl::Hidden, cl::init(false),
     cl::desc("If true, add a PrintModulePass at the beginning of the "
-             "explorative optimization pipeline"));
-static cl::opt<bool> ExploreDumpOptModuleIR(
-    "explore-dump-opt-module-ir", cl::Hidden, cl::init(false),
-    cl::desc("If true, add a PrintModulePass at the beginning of the "
-             "explorative codegen pipeline"));
+             "explorative codegen pipeline, printing to stdout"));
 
 class ExplorativeLVPass::InputBuilder {
   using ArrayID = unsigned;
@@ -224,7 +223,7 @@ void InputBuilder::build(Module &M, SmallVectorImpl<Value *> &Args) {
     GlobalVariable *GV = cast<GlobalVariable>(Val);
     if (GV->hasInitializer()) {
       // TODO: Should we preserve already present initializers?
-      LLVM_DEBUG(dbgs() << "Explorative LV: overwriting initializer "
+      LLVM_DEBUG(dbgs() << "XLV: overwriting initializer "
                         << *GV->getInitializer() << "\n");
     }
     GV->setInitializer(Input.second);
@@ -263,8 +262,8 @@ void InputBuilder::build(Module &M, SmallVectorImpl<Value *> &Args) {
     }
 
     LLVM_DEBUG(
-        dbgs() << "Explorative LV: ignoring memory access to global (not via "
-                  "argument) - is loop invariant code motion enabled?\n");
+        dbgs() << "XLV: ignoring memory access to global (not via argument) - "
+                  "is loop invariant code motion enabled?\n");
     // TODO: should we handle this case or should we move message?
   }
 }
@@ -470,7 +469,7 @@ Module *LoopModuleBuilder::getModule() {
 
   if (MakeExecutable &&
       isa<SCEVCouldNotCompute>(SE.getSymbolicMaxBackedgeTakenCount(&L))) {
-    LLVM_DEBUG(dbgs() << "Explorative LV: Cannot infer trip count\n");
+    LLVM_DEBUG(dbgs() << "XLV: cannot infer trip count\n");
     return nullptr;
   }
 
@@ -703,6 +702,9 @@ Function *LoopModuleBuilder::buildLoopFunc(unsigned VF, unsigned IF) {
   // Restore MDMap
   VMap.MD().swap(MDModuleMap);
 
+  if (VF == 1 && IF == 1 && XLVDumpFuncIR)
+    dbgs() << *LoopFunc << "\n";
+
   LoopFuncs.push_back(LoopFunc);
   return LoopFunc;
 }
@@ -770,6 +772,7 @@ void LoopModuleBuilder::buildMainFuncBody() {
     for (Value *&Arg : Args) {
       if (!Arg)
         Arg = Constant::getNullValue(*It);
+      LLVM_DEBUG(dbgs() << "XLV: arg " << *Arg << "\n");
       ++It;
     }
     CArgs = Args;
@@ -785,7 +788,7 @@ void LoopModuleBuilder::buildMainFuncBody() {
   }
 
   // Warmup (benchmarking only)
-  for (unsigned I = 0; I < ExploreBenchmarkWarmup; ++I)
+  for (unsigned I = 0; I < XLVBenchmarkWarmup; ++I)
     CallInst::Create(LoopFuncTy, FuncArg, Args, "", StartBB);
 
   // Start measuring
@@ -803,7 +806,7 @@ void LoopModuleBuilder::buildMainFuncBody() {
   PHINode *CCountPhi = PHINode::Create(I32Ty, 2, "counter", CLoopBB);
   CCountPhi->addIncoming(I320, CStartBB);
 
-  for (unsigned I = 0; I < ExploreBenchmarkLoopSize; ++I) {
+  for (unsigned I = 0; I < XLVBenchmarkLoopSize; ++I) {
     CallInst::Create(LoopFuncTy, FuncArg, Args, "", LoopBB);
     CallInst::Create(LoopFuncTy, CFuncArg, CArgs, "", CLoopBB);
   }
@@ -818,7 +821,7 @@ void LoopModuleBuilder::buildMainFuncBody() {
       BinaryOperator::CreateSub(CTNow, CTStart, "dt", CLoopBB);
   ICmpInst *CContLoop =
       new ICmpInst(*CLoopBB, CmpInst::ICMP_ULT, CTDiff,
-                   ConstantInt::get(I64Ty, ExploreBenchmarkTicks));
+                   ConstantInt::get(I64Ty, XLVBenchmarkTicks));
   BinaryOperator *CCountAdd =
       BinaryOperator::CreateAdd(CCountPhi, I321, "counter_next", CLoopBB);
 
@@ -895,7 +898,7 @@ static uint64_t performMCACostCalc(StringRef FileName, StringRef TargetCPU,
   auto MCAExecPath =
       sys::findProgramByName("llvm-mca", {getMainExecutable("llvm-mca")});
   if (!MCAExecPath) {
-    errs() << "Explorative LV: Could not find llvm-mca executable\n";
+    errs() << "XLV: could not find llvm-mca executable\n";
     return ExplorativeLVPass::InvalidCosts;
   }
 
@@ -909,20 +912,20 @@ static uint64_t performMCACostCalc(StringRef FileName, StringRef TargetCPU,
            "--mtriple=" + TargetTriple.str(), "--instruction-info=false",
            "--resource-pressure=false", "--json", FileName},
           None, {StringRef(""), MCAOutPath.str(), StringRef("")}) != 0) {
-    errs() << "Explorative LV: executing llvm-mca failed";
+    errs() << "XLV: executing llvm-mca failed";
     return ExplorativeLVPass::InvalidCosts;
   }
 
   // Read JSON
   auto MCAOutBuf = MemoryBuffer::getFile(MCAOutPath);
   if (!MCAOutBuf) {
-    errs() << "Explorative LV: could not read llvm-mca output\n";
+    errs() << "XLV: could not read llvm-mca output\n";
     return ExplorativeLVPass::InvalidCosts;
   }
   StringRef MCAOut = MCAOutBuf.get()->getBuffer();
   auto MCAJSON = json::parse(MCAOut);
   if (!MCAJSON) {
-    errs() << "Explorative LV: could not parse llvm-mca JSON\n";
+    errs() << "XLV: could not parse llvm-mca JSON\n";
     return ExplorativeLVPass::InvalidCosts;
   }
 
@@ -945,7 +948,7 @@ static uint64_t performMCACostCalc(StringRef FileName, StringRef TargetCPU,
       return TotalCycles;
   } while (false);
 
-  errs() << "Explorative LV: llvm-mca output is malformed\n";
+  errs() << "XLV: llvm-mca output is malformed\n";
   return ExplorativeLVPass::InvalidCosts;
 }
 
@@ -955,7 +958,7 @@ static uint64_t performMCACostCalc(StringRef FileName, StringRef TargetCPU,
 static void initCodeGen(legacy::PassManager &PM, TargetMachine &TM,
                         ExplorativeLVPass *XLV, const TargetLibraryInfo &TLI,
                         raw_pwrite_stream &OS, CodeGenFileType CGFT) {
-  if (ExploreDumpOptModuleIR)
+  if (XLVDumpModuleIR)
     PM.add(createPrintModulePass(outs()));
 
   PM.add(new ExplorativeLVHelper(XLV));
@@ -1011,14 +1014,7 @@ struct ExplorativeLVPass::OptPipelineContainer {
     PB.registerLoopAnalyses(LAM);
     PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
 
-    if (ExploreDumpModuleIR) {
-      MPM.addPass(PrintModulePass(outs()));
-      MPM.addPass(PB.buildPerModuleDefaultPipeline(OptimizationLevel::O3));
-    } else {
-      // This is more efficient as the vector containing the passes can be moved
-      // and does not have to be copied.
-      MPM = PB.buildPerModuleDefaultPipeline(OptimizationLevel::O3);
-    }
+    MPM = PB.buildPerModuleDefaultPipeline(OptimizationLevel::O3);
   }
 
   void run(Module &M) {
@@ -1050,16 +1046,16 @@ static void updateBestVFIF(unsigned &BestVF, unsigned &BestIF,
                            uint64_t &MinCosts, unsigned VF, unsigned IF,
                            uint64_t Costs) {
   if (Costs == ExplorativeLVPass::InvalidCosts) {
-    LLVM_DEBUG(dbgs() << "Explorative LV: invalid costs for VF " << VF
-                      << ", IF " << IF << "\n");
+    LLVM_DEBUG(dbgs() << "XLV: invalid costs for VF " << VF << ", IF " << IF
+                      << "\n");
     return;
   }
 
-  if (ExploreDivVF)
+  if (XLVDivVF)
     Costs /= VF;
 
-  LLVM_DEBUG(dbgs() << "Explorative LV: costs for VF " << VF << ", IF " << IF
-                    << ": " << Costs << "\n");
+  LLVM_DEBUG(dbgs() << "XLV: costs for VF " << VF << ", IF " << IF << ": "
+                    << Costs << "\n");
 
   if (Costs < MinCosts) {
     MinCosts = Costs;
@@ -1078,7 +1074,7 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, ScalarEvolution &SE,
                                     TargetLibraryInfo &TLI) {
   assert(OptPipeline && "OptPipeline not initialized");
 
-  LoopModuleBuilder Builder(F, L, SE, ExplorativeLV == Metric::Benchmark);
+  LoopModuleBuilder Builder(F, L, SE, XLVMetric == Metric::Benchmark);
   Module *M = Builder.getModule();
   if (!M)
     return true;
@@ -1087,13 +1083,13 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, ScalarEvolution &SE,
   unsigned BestIF = 1;
   uint64_t MinCosts = InvalidCosts;
 
-  if (ExplorativeLV == Metric::InstCount) {
+  if (XLVMetric == Metric::InstCount) {
     DenseMap<Function *, EvaluationInfo> ResultMap;
     EvaluationInfoMap = &ResultMap;
 
     // Build a module containing functions for all VF/IF combinations
-    for (unsigned VF = 1; VF <= ExploreMaxVF; VF *= 2) {
-      for (unsigned IF = 1; IF <= ExploreMaxIF; IF *= 2) {
+    for (unsigned VF = 1; VF <= XLVMaxVF; VF *= 2) {
+      for (unsigned IF = 1; IF <= XLVMaxIF; IF *= 2) {
         Function *Func = Builder.buildLoopFunc(VF, IF);
         ResultMap[Func] = {VF, IF, InvalidCosts};
       }
@@ -1103,16 +1099,16 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, ScalarEvolution &SE,
     OptPipeline->run(*M);
     NullCGPipeline->PM.run(*M);
 
-    for (auto KV : ResultMap) {
-      EvaluationInfo &Info = KV.getSecond();
+    for (auto &KV : ResultMap) {
+      EvaluationInfo &Info = KV.second;
       updateBestVFIF(BestVF, BestIF, MinCosts, Info.VF, Info.IF, Info.Costs);
     }
 
     EvaluationInfoMap = nullptr;
-  } else if (ExplorativeLV == Metric::MCA) {
+  } else if (XLVMetric == Metric::MCA) {
     // Try out which VF works best for this loop
-    for (unsigned VF = 1; VF <= ExploreMaxVF; VF *= 2) {
-      for (unsigned IF = 1; IF <= ExploreMaxIF; IF *= 2) {
+    for (unsigned VF = 1; VF <= XLVMaxVF; VF *= 2) {
+      for (unsigned IF = 1; IF <= XLVMaxIF; IF *= 2) {
         Builder.buildLoopFunc(VF, IF);
         OptPipeline->run(*M);
 
@@ -1139,11 +1135,11 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, ScalarEvolution &SE,
       }
     }
   } else {
-    assert(ExplorativeLV == Metric::Benchmark);
+    assert(XLVMetric == Metric::Benchmark);
 
     // Build a module containing functions for all VF/IF combinations
-    for (unsigned VF = 1; VF <= ExploreMaxVF; VF *= 2) {
-      for (unsigned IF = 1; IF <= ExploreMaxIF; IF *= 2)
+    for (unsigned VF = 1; VF <= XLVMaxVF; VF *= 2) {
+      for (unsigned IF = 1; IF <= XLVMaxIF; IF *= 2)
         Builder.buildLoopFunc(VF, IF);
     }
 
@@ -1175,7 +1171,7 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, ScalarEvolution &SE,
     // Create an executable
     auto CCPath = sys::findProgramByName("cc"); // FIXME: do this only once
     if (!CCPath) {
-      errs() << "Explorative LV: Could not find cc executable\n";
+      errs() << "XLV: could not find cc executable\n";
       return true;
     }
     SmallString<32> ExecPath;
@@ -1183,15 +1179,15 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, ScalarEvolution &SE,
     FileRemover ExecRemover(ExecPath);
     if (sys::ExecuteAndWait(CCPath.get(), {"cc", "-o", ExecPath, ObjectPath}) !=
         0) {
-      errs() << "Explorative LV: Linking failed\n";
+      errs() << "XLV: linking failed\n";
       return true;
     }
 
     // Do the benchmarking
     unsigned TimeoutS =
-        1 + ((Builder.getNumLoopFuncs() + 1) * ExploreBenchmarkTicks) /
-                CLOCKS_PER_SEC;
-    LLVM_DEBUG(dbgs() << "Explorative LV: Benchmarking for up to " << TimeoutS
+        1 +
+        ((Builder.getNumLoopFuncs() + 1) * XLVBenchmarkTicks) / CLOCKS_PER_SEC;
+    LLVM_DEBUG(dbgs() << "XLV: benchmarking for up to " << TimeoutS
                       << " s ...\n");
     SmallString<32> BenchResPath;
     sys::fs::createTemporaryFile("explorative-lv-out", "txt", BenchResPath);
@@ -1199,22 +1195,22 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, ScalarEvolution &SE,
     if (sys::ExecuteAndWait(ExecPath, {"explorative-lv"}, None,
                             {StringRef(""), BenchResPath.str(), StringRef("")},
                             TimeoutS) != 0) {
-      errs() << "Explorative LV: benchmarking failed\n";
+      errs() << "XLV: benchmarking failed\n";
       return true;
     }
 
     auto BenchResBuf = MemoryBuffer::getFile(BenchResPath);
     if (!BenchResBuf) {
-      errs() << "Explorative LV: could not load benchmarking results";
+      errs() << "XLV: could not load benchmarking results";
       return true;
     }
     StringRef BenchRes = BenchResBuf.get()->getBuffer();
 
-    for (unsigned VF = 1; VF <= ExploreMaxVF; VF *= 2) {
-      for (unsigned IF = 1; IF <= ExploreMaxIF; IF *= 2) {
+    for (unsigned VF = 1; VF <= XLVMaxVF; VF *= 2) {
+      for (unsigned IF = 1; IF <= XLVMaxIF; IF *= 2) {
         uint64_t Costs;
         if (BenchRes.consumeInteger(10, Costs)) {
-          errs() << "Explorative LV: could not read integer";
+          errs() << "XLV: could not read integer from benchmarking results";
           return true;
         }
         BenchRes = BenchRes.drop_front(); // drop '\n'
@@ -1226,9 +1222,8 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, ScalarEvolution &SE,
 
   // Force the vectorizer to use the VF and IF that showed to have the lowest
   // cost
-  LLVM_DEBUG(
-      dbgs() << "Explorative LV: choosing this VF and IF for vectorization: "
-             << BestVF << " and " << BestIF << "\n");
+  LLVM_DEBUG(dbgs() << "XLV: choosing this VF and IF for vectorization: "
+                    << BestVF << " and " << BestIF << "\n");
   addStringMetadataToLoop(&L, "llvm.loop.vectorize.width", BestVF);
   addStringMetadataToLoop(&L, "llvm.loop.interleave.count", BestIF);
 
@@ -1243,8 +1238,8 @@ static void collectSupportedLoops(Loop &L, LoopInfo *LI,
       return;
 
     if (findStringMetadataForLoop(&L, "llvm.loop.vectorize.width")) {
-      LLVM_DEBUG(dbgs() << "Explorative LV: loop already has user annotation, "
-                           "skipping exploration\n");
+      LLVM_DEBUG(dbgs() << "XLV: loop already has user annotation, skipping "
+                           "exploration\n");
       return;
     }
 
@@ -1611,10 +1606,10 @@ class SCEVMemAccessAnalyzer : private SCEVCompVisitor<SCEVMemAccessAnalyzer> {
     });
   }
 
-  /// AddRec is (usually?) the outermost expression, so this is a no-op.
   Optional<APInt> visitAddRecExpr(const SCEVAddRecExpr *Expr) {
-    LLVM_DEBUG(dbgs() << "Explorative LV: found an inner SCEVAddRecExpr when "
-                         "analyzing memory accesses\n");
+    // TODO: fix this
+    LLVM_DEBUG(dbgs() << "XLV: found an inner SCEVAddRecExpr when analyzing "
+                         "memory accesses\n");
     return None;
   }
 
@@ -1633,8 +1628,8 @@ class SCEVMemAccessAnalyzer : private SCEVCompVisitor<SCEVMemAccessAnalyzer> {
 
     if (BasePointer != Val) {
       if (BasePointer) {
-        LLVM_DEBUG(dbgs() << "Explorative LV: found two base pointers when "
-                             "analyzing memory accesses\n");
+        LLVM_DEBUG(dbgs() << "XLV: found two base pointers when analyzing "
+                             "memory accesses\n");
         return None;
       }
 
@@ -1693,13 +1688,12 @@ static void inferInputs(const Function &F, Loop &L, ScalarEvolution &SE,
                         ExplorativeLVPass::InputBuilder &InferredInputs) {
   // Obtain/choose a trip count
   const SCEV *MaxBackedgeTakenCount = SE.getSymbolicMaxBackedgeTakenCount(&L);
-  LLVM_DEBUG(dbgs() << "Explorative LV: backedge taken count is "
-                    << *MaxBackedgeTakenCount << "\n");
+  LLVM_DEBUG(dbgs() << "XLV: backedge taken count is " << *MaxBackedgeTakenCount
+                    << "\n");
   Optional<APInt> BTRes = SCEVBackedgeTakenAnalyzer::analyze(
-      SE, MaxBackedgeTakenCount, InferredInputs, ExploreDesiredTripCount - 1);
+      SE, MaxBackedgeTakenCount, InferredInputs, XLVDesiredTripCount - 1);
   if (!BTRes) {
-    LLVM_DEBUG(
-        dbgs() << "Explorative LV: could not obtain/choose a trip count\n");
+    LLVM_DEBUG(dbgs() << "XLV: could not obtain/choose a trip count\n");
     return;
   }
   const SCEV *ItStart = SE.getConstant(APInt(BTRes->getBitWidth(), 0));
@@ -1725,8 +1719,7 @@ static void inferInputs(const Function &F, Loop &L, ScalarEvolution &SE,
       }
 
       const SCEV *LocSCEV = SE.getSCEV(const_cast<Value *>(Loc));
-      LLVM_DEBUG(dbgs() << "Explorative LV: Memory access at " << *LocSCEV
-                        << "\n");
+      LLVM_DEBUG(dbgs() << "XLV: memory access at " << *LocSCEV << "\n");
       MAAnalyzer.analyze(LocSCEV);
     }
   }
@@ -1742,10 +1735,8 @@ PreservedAnalyses ExplorativeLVPass::run(Function &F,
     if (MainPass->InferredInputs) {
       auto LoopIt = LI.begin();
       if (LoopIt + 1 != LI.end()) {
-        LLVM_DEBUG(
-            dbgs()
-            << "Explorative LV: Expected exactly one loop in loop function "
-            << F.getName() << "\n");
+        LLVM_DEBUG(dbgs() << "XLV: expected exactly one loop in loop function "
+                          << F.getName() << "\n");
         return PreservedAnalyses::all();
       }
       inferInputs(F, **LoopIt, SE, *MainPass->InferredInputs);
@@ -1784,14 +1775,17 @@ PreservedAnalyses ExplorativeLVPass::run(Function &F,
   if (!OptPipeline)
     OptPipeline = new OptPipelineContainer(TM, PTO, PGOOpt, this, TLI);
   // If this is a code size evaluation, we can re-use the same backend pipeline.
-  if (!NullCGPipeline && ExplorativeLV == Metric::InstCount)
+  if (!NullCGPipeline && XLVMetric == Metric::InstCount)
     NullCGPipeline = new NullCGPipelineContainer(*TM, this, TLI);
 
+  unsigned LoopNo = 0;
   do {
     Loop *L = Worklist.pop_back_val();
+    LLVM_DEBUG(dbgs() << "XLV: --- processing loop " << ++LoopNo << " in "
+                      << F.getName() << " ---\n");
     if (processLoop(F, *L, SE, TLI)) {
-      LLVM_DEBUG(dbgs() << "Processing loop failed, letting the AutoVectorizer "
-                           "determine VF and IF\n");
+      LLVM_DEBUG(dbgs() << "XLV: processing loop failed, letting the "
+                           "AutoVectorizer determine VF and IF\n");
       addStringMetadataToLoop(L, "llvm.loop.vectorize.width", 0);
       addStringMetadataToLoop(L, "llvm.loop.interleave.count", 0);
     }

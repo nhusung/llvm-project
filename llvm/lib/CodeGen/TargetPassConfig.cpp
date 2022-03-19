@@ -220,7 +220,7 @@ static cl::opt<CFLAAType> UseCFLAA(
 
 namespace llvm {
 // Whether to enable the MachineCodeExplorer for explorative vectorization
-extern cl::opt<ExplorativeLVPass::Metric> ExplorativeLV;
+extern cl::opt<ExplorativeLVPass::Metric> XLVMetric;
 } // namespace llvm
 
 /// Option names for limiting the codegen pipeline.
@@ -1278,7 +1278,7 @@ void TargetPassConfig::addMachinePasses() {
 
   // Add MachineCodeExplorer pass if we perform explorative vectorization and do
   // not use another metric
-  if (ExplorativeLV == ExplorativeLVPass::Metric::InstCount)
+  if (XLVMetric == ExplorativeLVPass::Metric::InstCount)
     addPass(createMachineCodeExplorer());
 
   AddingMachinePasses = false;

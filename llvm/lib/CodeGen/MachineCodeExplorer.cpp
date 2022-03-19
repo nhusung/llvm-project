@@ -35,7 +35,7 @@ struct MachineCodeExplorer : public MachineFunctionPass {
   bool runOnMachineFunction(MachineFunction &F) override;
 };
 
-extern cl::opt<bool> ExplorePlain;
+extern cl::opt<bool> XLVPlain;
 
 } // namespace llvm
 
@@ -56,7 +56,7 @@ static uint64_t getCodeSizeEvaluation(MachineFunction &Fn, unsigned VF) {
       return ExplorativeLVPass::InvalidCosts;
   }
 
-  if (ExplorePlain)
+  if (XLVPlain)
     return Fn.getInstructionCount();
 
   unsigned VectorCount = 0;
