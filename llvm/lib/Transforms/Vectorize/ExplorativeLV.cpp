@@ -805,12 +805,12 @@ void LoopModuleBuilder::buildMainFuncBody() {
   BasicBlock *LoopBB = BasicBlock::Create(C, "bench_loop", BenchFunc);
   BranchInst::Create(LoopBB, StartBB);
   PHINode *CountPhi = PHINode::Create(I32Ty, 2, "counter", LoopBB);
-  CountPhi->addIncoming(I320, StartBB);
+  CountPhi->addIncoming(I321, StartBB);
 
   BasicBlock *CLoopBB = BasicBlock::Create(C, "calib_loop", CalibFunc);
   BranchInst::Create(CLoopBB, CStartBB);
   PHINode *CCountPhi = PHINode::Create(I32Ty, 2, "counter", CLoopBB);
-  CCountPhi->addIncoming(I320, CStartBB);
+  CCountPhi->addIncoming(I321, CStartBB);
 
   for (unsigned I = 0; I < XLVBenchmarkLoopSize; ++I) {
     CallInst::Create(LoopFuncTy, FuncArg, Args, "", LoopBB);
@@ -836,30 +836,40 @@ void LoopModuleBuilder::buildMainFuncBody() {
   BranchInst::Create(EvalBB, LoopBB, ContLoop, LoopBB);
   CountPhi->addIncoming(CountAdd, LoopBB);
 
-  BasicBlock *CRetBB = BasicBlock::Create(C, "calib_ret", CalibFunc);
-  BranchInst::Create(CLoopBB, CRetBB, CContLoop, CLoopBB);
+  BasicBlock *CEvalBB = BasicBlock::Create(C, "calib_ret", CalibFunc);
+  BranchInst::Create(CLoopBB, CEvalBB, CContLoop, CLoopBB);
   CCountPhi->addIncoming(CCountAdd, CLoopBB);
-  // For calibration, we are already done
-  ReturnInst::Create(C, CCountAdd, CRetBB);
 
   // Stop measuring
   CallInst *TEnd = CallInst::Create(ClockFuncTy, ClockFunc, "te", EvalBB);
   BinaryOperator *TDiff = BinaryOperator::CreateSub(TEnd, TStart, "dt", EvalBB);
 
-  // Create format string
+  // Create format strings
   static_assert(sizeof(unsigned long long) == 8,
                 "unsigned long long is expected to be 64 bit");
-  Constant *FormatStr = ConstantDataArray::getString(C, "%llu\n\0", false);
+  static_assert(sizeof(unsigned) == 4, "unsigned is expected to be 32 bit");
+  Constant *FormatStr = ConstantDataArray::getString(C, "%llu\n");
+  Constant *CFormatStr = ConstantDataArray::getString(C, "%llu %u\n");
   GlobalVariable *FormatStrGV =
       new GlobalVariable(*M, FormatStr->getType(), true,
                          GlobalValue::PrivateLinkage, FormatStr, "fstr");
+  GlobalVariable *CFormatStrGV =
+      new GlobalVariable(*M, CFormatStr->getType(), true,
+                         GlobalValue::PrivateLinkage, CFormatStr, "cfstr");
   Constant *FormatStrPtr = ConstantExpr::getInBoundsGetElementPtr(
       FormatStrGV->getValueType(), FormatStrGV,
       ArrayRef<Constant *>{I640, I640});
+  Constant *CFormatStrPtr = ConstantExpr::getInBoundsGetElementPtr(
+      CFormatStrGV->getValueType(), CFormatStrGV,
+      ArrayRef<Constant *>{I640, I640});
 
-  // `printf(fstr, dt); return;`
+  // `printf(fstr, dt); return;` / `printf(fstr, dt, n); return;`
   CallInst::Create(PrintfFuncTy, PrintfFunc, {FormatStrPtr, TDiff}, "", EvalBB);
   ReturnInst::Create(C, EvalBB);
+
+  CallInst::Create(PrintfFuncTy, PrintfFunc, {CFormatStrPtr, CTDiff, CCountPhi},
+                   "", CEvalBB);
+  ReturnInst::Create(C, CCountPhi, CEvalBB);
 
   // Declare & define `int main(void)`
   Function *MainFunc = Function::Create(
@@ -1048,33 +1058,6 @@ ExplorativeLVPass::~ExplorativeLVPass() {
   delete OptPipeline;
 }
 
-static void updateBestVFIF(unsigned &BestVF, unsigned &BestIF,
-                           uint64_t &MinCosts, unsigned VF, unsigned IF,
-                           uint64_t Costs) {
-  if (Costs == ExplorativeLVPass::InvalidCosts) {
-    LLVM_DEBUG(dbgs() << "XLV: invalid costs for VF " << VF << ", IF " << IF
-                      << "\n");
-    return;
-  }
-
-  if (XLVDivVF)
-    Costs /= VF;
-
-  LLVM_DEBUG(dbgs() << "XLV: costs for VF " << VF << ", IF " << IF << ": "
-                    << Costs << "\n");
-
-  if (Costs < MinCosts) {
-    MinCosts = Costs;
-    BestVF = VF;
-    BestIF = IF;
-  } else if (Costs == MinCosts && (VF == 1 || VF >= BestVF) && IF >= BestIF) {
-    // If costs are equal to costs retrieved before, always choose the
-    // higher VF-IF combination unless best VF is scalar.
-    BestVF = VF;
-    BestIF = IF;
-  }
-}
-
 // returns whether an error occured
 bool ExplorativeLVPass::processLoop(Function &F, Loop &L, ScalarEvolution &SE,
                                     TargetLibraryInfo &TLI) {
@@ -1088,6 +1071,32 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, ScalarEvolution &SE,
   unsigned BestVF = 1;
   unsigned BestIF = 1;
   uint64_t MinCosts = InvalidCosts;
+
+  auto UpdateBest = [&BestVF, &BestIF, &MinCosts](unsigned VF, unsigned IF,
+                                                  uint64_t Costs) {
+    if (Costs == ExplorativeLVPass::InvalidCosts) {
+      LLVM_DEBUG(dbgs() << "XLV: invalid costs for VF " << VF << ", IF " << IF
+                        << "\n");
+      return;
+    }
+
+    if (XLVDivVF)
+      Costs /= VF;
+
+    LLVM_DEBUG(dbgs() << "XLV: costs for VF " << VF << ", IF " << IF << ": "
+                      << Costs << "\n");
+
+    if (Costs < MinCosts) {
+      MinCosts = Costs;
+      BestVF = VF;
+      BestIF = IF;
+    } else if (Costs == MinCosts && (VF == 1 || VF >= BestVF) && IF >= BestIF) {
+      // If costs are equal to costs retrieved before, always choose the
+      // higher VF-IF combination unless best VF is scalar.
+      BestVF = VF;
+      BestIF = IF;
+    }
+  };
 
   if (XLVMetric == Metric::InstCount) {
     DenseMap<Function *, EvaluationInfo> ResultMap;
@@ -1107,7 +1116,7 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, ScalarEvolution &SE,
 
     for (auto &KV : ResultMap) {
       EvaluationInfo &Info = KV.second;
-      updateBestVFIF(BestVF, BestIF, MinCosts, Info.VF, Info.IF, Info.Costs);
+      UpdateBest(Info.VF, Info.IF, Info.Costs);
     }
 
     EvaluationInfoMap = nullptr;
@@ -1135,7 +1144,7 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, ScalarEvolution &SE,
         // sure the assembly printer has finished
         uint64_t Costs = performMCACostCalc(ASMPath, TM->getTargetCPU(),
                                             M->getTargetTriple());
-        updateBestVFIF(BestVF, BestIF, MinCosts, VF, IF, Costs);
+        UpdateBest(VF, IF, Costs);
 
         Builder.clearLoopFuncs();
       }
@@ -1216,22 +1225,43 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, ScalarEvolution &SE,
 
     auto BenchResBuf = MemoryBuffer::getFile(BenchResPath);
     if (!BenchResBuf) {
-      errs() << "XLV: could not load benchmarking results";
+      errs() << "XLV: could not load benchmarking results\n";
       return true;
     }
     StringRef BenchRes = BenchResBuf.get()->getBuffer();
 
-    for (unsigned VF = 1; VF <= XLVMaxVF; VF *= 2) {
-      for (unsigned IF = 1; IF <= XLVMaxIF; IF *= 2) {
-        uint64_t Costs;
-        if (BenchRes.consumeInteger(10, Costs)) {
-          errs() << "XLV: could not read integer from benchmarking results";
-          return true;
-        }
-        BenchRes = BenchRes.drop_front(); // drop '\n'
+    // Read calibration info
+    bool ReadFailed = [&BenchRes, &UpdateBest]() {
+      uint64_t CalibTime;
+      if (BenchRes.consumeInteger(10, CalibTime))
+        return true;
+      BenchRes = BenchRes.drop_front(); // drop ' '
+      unsigned NRuns;
+      if (BenchRes.consumeInteger(10, NRuns))
+        return true;
+      LLVM_DEBUG(dbgs() << "XLV: calibration run took " << CalibTime
+                        << " ticks, executed each loop function "
+                        << XLVBenchmarkLoopSize * NRuns << " times\n");
 
-        updateBestVFIF(BestVF, BestIF, MinCosts, VF, IF, Costs);
+      for (unsigned VF = 1; VF <= XLVMaxVF; VF *= 2) {
+        for (unsigned IF = 1; IF <= XLVMaxIF; IF *= 2) {
+          BenchRes = BenchRes.drop_front(); // drop '\n'
+
+          uint64_t Costs;
+          if (BenchRes.consumeInteger(10, Costs))
+            return true;
+
+          UpdateBest(VF, IF, Costs);
+        }
       }
+      return false;
+    }();
+    if (ReadFailed) {
+      errs() << "XLV: could not read integer from benchmarking results.  You "
+                "can find the binary at "
+             << ExecPath << "\n";
+      ExecRemover.releaseFile();
+      return true;
     }
   }
 
