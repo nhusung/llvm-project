@@ -143,7 +143,7 @@ class ExplorativeLVPass::InputBuilder {
   SmallVector<MemAccessRange> MemRanges;
 
 public:
-  ArrayID addMemAccess(Value *Val, int64_t Start, int64_t End);
+  ArrayID addMemAccess(Value *Val, int64_t Loc);
   void addMemAccessForArray(Value *Val, ArrayID Array, int64_t Offset);
 
   APInt tryAddIntInput(Value *Val, APInt &&Desired);
@@ -154,31 +154,24 @@ public:
 };
 using InputBuilder = ExplorativeLVPass::InputBuilder;
 
-InputBuilder::ArrayID InputBuilder::addMemAccess(Value *Val, int64_t Start,
-                                                 int64_t End) {
-  assert(Start <= End && "Start <= End required");
-
+InputBuilder::ArrayID InputBuilder::addMemAccess(Value *Val, int64_t Loc) {
   ArrayID RangeID = MemRanges.size();
   auto Res = MemAccesses.try_emplace(Val, RangeID, 0);
   if (Res.second) { // Did emplace
     // Sanitize the range.  Even if the memory access is in [Start, End], we
     // also want that the pointer itself is in [Start, End].
-    if (Start > 0)
-      Start = 0;
-    if (End < 0)
-      End = 0;
-
-    MemRanges.emplace_back(Start, End,
+    MemRanges.emplace_back(Loc > 0 ? 0 : Loc, Loc < 0 ? 0 : Loc,
                            Val->getType()->getNonOpaquePointerElementType());
     return RangeID;
   }
 
   RangeID = Res.first->second.first;
   MemAccessRange &Range = MemRanges[RangeID];
-  if (Start < Range.Start)
-    Range.Start = Start;
-  if (End > Range.End)
-    Range.End = End;
+  if (Loc < Range.Start) {
+    Range.Start = Loc;
+  } else if (Loc > Range.End) {
+    Range.End = Loc;
+  }
   return RangeID;
 }
 
@@ -1574,11 +1567,12 @@ public:
         Analyzer.visit(Expr, APInt(SE.getTypeSizeInBits(Expr->getType()),
                                    DesiredBackedgeTaken));
     if (Analyzer.InferredPtrStart && Analyzer.InferredPtrEnd) {
+      auto Array = Inferred.addMemAccess(Analyzer.InferredPtrStart, 0);
       // One less than InferredPtrDiff would be enough, since the range is
       // inclusive.  However, we'd also need to change addMemAccessForArray such
       // that the element is not allocated there ...
-      auto Array = Inferred.addMemAccess(Analyzer.InferredPtrStart, 0,
-                                         Analyzer.InferredPtrDiff);
+      Inferred.addMemAccess(Analyzer.InferredPtrStart,
+                            Analyzer.InferredPtrDiff);
       Inferred.addMemAccessForArray(Analyzer.InferredPtrEnd, Array,
                                     Analyzer.InferredPtrDiff);
     }
@@ -1591,8 +1585,11 @@ class SCEVMemAccessAnalyzer : private SCEVCompVisitor<SCEVMemAccessAnalyzer> {
 
   ScalarEvolution &SE;
   InputBuilder &Inferred;
-  const SCEV *ItStart;
-  const SCEV *ItEnd;
+  const SCEVConstant *ItStart;
+  const SCEVConstant *ItCurrent;
+  const SCEVConstant *ItEnd;
+
+  enum { NoAddRec, MonotoneAddRec, ArbitraryAddRec } AddRecKind;
 
   Value *BasePointer = nullptr;
 
@@ -1652,10 +1649,21 @@ class SCEVMemAccessAnalyzer : private SCEVCompVisitor<SCEVMemAccessAnalyzer> {
   }
 
   Optional<APInt> visitAddRecExpr(const SCEVAddRecExpr *Expr) {
-    // TODO: fix this
-    LLVM_DEBUG(dbgs() << "XLV: found an inner SCEVAddRecExpr when analyzing "
-                         "memory accesses\n");
-    return None;
+    if (ItCurrent == ItStart && AddRecKind < ArbitraryAddRec) {
+      AddRecKind = MonotoneAddRec;
+      if (!Expr->isAffine()) {
+        const auto *It = Expr->op_begin() + 1;
+        const auto *End = Expr->op_end();
+        for (; It != End; ++It) {
+          const SCEVConstant *Const = dyn_cast<SCEVConstant>(*It);
+          if (!Const || Const->getAPInt().slt(0)) {
+            AddRecKind = ArbitraryAddRec;
+            break;
+          }
+        }
+      }
+    }
+    return visit(Expr->evaluateAtIteration(ItCurrent, SE));
   }
 
   Optional<APInt> visitUnknown(const SCEVUnknown *Unknown) {
@@ -1691,38 +1699,38 @@ class SCEVMemAccessAnalyzer : private SCEVCompVisitor<SCEVMemAccessAnalyzer> {
 
 public:
   SCEVMemAccessAnalyzer(ScalarEvolution &SE, InputBuilder &InferredInputs,
-                        const SCEV *ItStart, const SCEV *ItEnd)
+                        const SCEVConstant *ItStart, const SCEVConstant *ItEnd)
       : SE(SE), Inferred(InferredInputs), ItStart(ItStart), ItEnd(ItEnd) {}
 
   void analyze(const SCEV *Expr) {
+    ItCurrent = ItStart;
+    AddRecKind = NoAddRec;
     BasePointer = nullptr;
-    if (const SCEVAddRecExpr *AddRec = dyn_cast<SCEVAddRecExpr>(Expr)) {
-      if (AddRec->isAffine()) {
-        Optional<APInt> StartRes =
-            visit(AddRec->evaluateAtIteration(ItStart, SE));
-        if (!StartRes)
-          return;
-        Optional<APInt> EndRes = visit(AddRec->evaluateAtIteration(ItEnd, SE));
-        if (!EndRes)
-          return;
-        if (BasePointer) {
-          int64_t Start = StartRes->getSExtValue();
-          int64_t End = EndRes->getSExtValue();
-          if (Start > End)
-            std::swap(Start, End);
-          Inferred.addMemAccess(BasePointer, Start, End);
-        }
-      } else {
-        // TODO: handle this
-        dbgs() << "Got non-affine memory access: " << *Expr << "\n";
-      }
-    } else {
-      Optional<APInt> Res = visit(Expr);
-      if (!Res)
-        return;
-      int64_t Loc = Res->getSExtValue();
-      if (BasePointer)
-        Inferred.addMemAccess(BasePointer, Loc, Loc);
+
+    Optional<APInt> Res = visit(Expr);
+    if (!Res)
+      return;
+    if (!BasePointer)
+      return;
+
+    Inferred.addMemAccess(BasePointer, Res->getSExtValue());
+
+    if (AddRecKind == NoAddRec)
+      return;
+
+    if (AddRecKind == MonotoneAddRec) {
+      ItCurrent = ItEnd;
+      Inferred.addMemAccess(BasePointer, visit(Expr)->getSExtValue());
+      return;
+    }
+
+    assert(AddRecKind == ArbitraryAddRec);
+    // In this case, it does not necessarily suffice to evaluate the SCEV for
+    // the first and the last iteration.  However, we can evaluate it for every
+    // iteration.
+    while (ItCurrent != ItEnd) {
+      ItCurrent = cast<SCEVConstant>(SE.getConstant(ItCurrent->getAPInt() + 1));
+      Inferred.addMemAccess(BasePointer, visit(Expr)->getSExtValue());
     }
   }
 };
@@ -1741,8 +1749,9 @@ static void inferInputs(const Function &F, Loop &L, ScalarEvolution &SE,
     LLVM_DEBUG(dbgs() << "XLV: could not obtain/choose a trip count\n");
     return;
   }
-  const SCEV *ItStart = SE.getConstant(APInt(BTRes->getBitWidth(), 0));
-  const SCEV *ItEnd = SE.getConstant(*BTRes);
+  const SCEVConstant *ItStart =
+      cast<SCEVConstant>(SE.getConstant(APInt(BTRes->getBitWidth(), 0)));
+  const SCEVConstant *ItEnd = cast<SCEVConstant>(SE.getConstant(*BTRes));
   SCEVMemAccessAnalyzer MAAnalyzer(SE, InferredInputs, ItStart, ItEnd);
 
   // Look at all load an store instructions and determine memory to allocate
