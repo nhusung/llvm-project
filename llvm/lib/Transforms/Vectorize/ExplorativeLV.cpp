@@ -336,8 +336,12 @@ bool LoopModuleBuilder::determineIO() {
         // analyzing these.  Inline assembly is also embedded using call
         // instructions, we'd have to make these distinctions here.  However,
         // we allow intrinsics.
-        if (!isa<IntrinsicInst>(I))
+        if (!isa<IntrinsicInst>(I)) {
+          LLVM_DEBUG(dbgs()
+                     << "XLV: loop contains a non-intrinsic call instruction: "
+                     << I << "\n");
           return false;
+        }
 
         // TODO: are there intrinsics we should forbid?
       }
