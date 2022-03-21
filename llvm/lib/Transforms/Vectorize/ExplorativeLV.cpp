@@ -28,6 +28,7 @@
 #include "llvm/Analysis/LoopIterator.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
+#include "llvm/IR/Argument.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DebugInfo.h"
@@ -120,8 +121,6 @@ static cl::opt<bool> XLVDumpModuleIR(
              "explorative codegen pipeline, printing to stdout"));
 
 class ExplorativeLVPass::InputBuilder {
-  using ArrayID = unsigned;
-
   class MemAccessRange {
     friend class InputBuilder;
 
@@ -138,126 +137,107 @@ class ExplorativeLVPass::InputBuilder {
         : Start(Start), End(End), ElementType(ElementType) {}
   };
 
-  DenseMap<Value *, ConstantInt *> IntInputs;
-  DenseMap<Value *, std::pair<ArrayID, int64_t>> MemAccesses;
+  SmallVector<ConstantInt *> IntInputs;
+  SmallVector<Optional<std::pair<unsigned, int64_t>>> MemAccesses;
   SmallVector<MemAccessRange> MemRanges;
 
 public:
-  ArrayID addMemAccess(Value *Val, int64_t Loc);
-  void addMemAccessForArray(Value *Val, ArrayID Array, int64_t Offset);
+  void addMemAccess(Argument *Arg, int64_t Loc);
+  void addMemAccessWithEndptr(Argument *ArgStart, Argument *ArgEnd,
+                              uint64_t Diff);
 
-  APInt tryAddIntInput(Value *Val, APInt &&Desired);
+  APInt tryAddIntInput(const Argument *Arg, APInt &&Desired) {
+    ConstantInt *&Input = IntInputs[Arg->getArgNo()];
+    if (Input)
+      return Input->getValue();
 
-  void build(Module &M, SmallVectorImpl<Value *> &Args);
+    Input = ConstantInt::get(Arg->getType()->getContext(), Desired);
+    return Desired;
+  }
 
-  unsigned NumInputArgs = 0;
+  void build(Module &M, ArrayRef<Type *> Params,
+             SmallVectorImpl<Value *> &Args);
+
+  void setNumInputArgs(unsigned Num) {
+    assert(IntInputs.size() == 0 && MemAccesses.size() == 0 &&
+           "Must set NumInputArgs once only");
+    IntInputs.assign(Num, nullptr);
+    MemAccesses.assign(Num, None);
+  }
+
+  bool isInputArg(const Argument *Arg) {
+    return Arg->getArgNo() < IntInputs.size();
+  }
 };
 using InputBuilder = ExplorativeLVPass::InputBuilder;
 
-InputBuilder::ArrayID InputBuilder::addMemAccess(Value *Val, int64_t Loc) {
-  ArrayID RangeID = MemRanges.size();
-  auto Res = MemAccesses.try_emplace(Val, RangeID, 0);
-  if (Res.second) { // Did emplace
+void InputBuilder::addMemAccess(Argument *Arg, int64_t Loc) {
+  auto &MemAccess = MemAccesses[Arg->getArgNo()];
+  if (MemAccess) { // Already present, just extend the range (if necessary)
+    MemAccessRange &Range = MemRanges[MemAccess->first];
+    if (Loc < Range.Start) {
+      Range.Start = Loc;
+    } else if (Loc > Range.End) {
+      Range.End = Loc;
+    }
+  } else { // New access
+    MemAccess.emplace(MemRanges.size(), /* offset */ 0);
+
     // Sanitize the range.  Even if the memory access is in [Start, End], we
-    // also want that the pointer itself is in [Start, End].
+    // also want the pointer itself to be in [Start, End].
     MemRanges.emplace_back(Loc > 0 ? 0 : Loc, Loc < 0 ? 0 : Loc,
-                           Val->getType()->getNonOpaquePointerElementType());
-    return RangeID;
+                           Arg->getType()->getNonOpaquePointerElementType());
   }
-
-  RangeID = Res.first->second.first;
-  MemAccessRange &Range = MemRanges[RangeID];
-  if (Loc < Range.Start) {
-    Range.Start = Loc;
-  } else if (Loc > Range.End) {
-    Range.End = Loc;
-  }
-  return RangeID;
 }
 
-void InputBuilder::addMemAccessForArray(Value *Val, ArrayID Array,
-                                        int64_t Offset) {
-  MemAccessRange &Range = MemRanges[Array];
-  assert(Val->getType()->getNonOpaquePointerElementType() ==
-             Range.ElementType &&
-         "Pointee types must agree");
-  if (Offset < Range.Start) {
-    Range.Start = Offset;
-  } else if (Offset > Range.End) {
-    Range.End = Offset;
-  }
-  MemAccesses.try_emplace(Val, Array, Offset);
+void InputBuilder::addMemAccessWithEndptr(Argument *ArgStart, Argument *ArgEnd,
+                                          uint64_t Diff) {
+  assert(ArgStart->getType() == ArgEnd->getType() && "types must agree");
+  auto &MemAccessStart = MemAccesses[ArgStart->getArgNo()];
+  auto &MemAccessEnd = MemAccesses[ArgEnd->getArgNo()];
+  assert(!MemAccessStart && !MemAccessEnd &&
+         "currently we only support adding new mem accesses with end pointer");
+
+  unsigned RangeID = MemRanges.size();
+  MemAccessStart.emplace(RangeID, /* offset */ 0);
+  MemAccessEnd.emplace(RangeID, Diff);
+
+  MemRanges.emplace_back(0, Diff - 1,
+                         ArgStart->getType()->getNonOpaquePointerElementType());
 }
 
-APInt InputBuilder::tryAddIntInput(Value *Val, APInt &&Desired) {
-  // Use a dummy pointer first
-  auto Res = IntInputs.try_emplace(Val, nullptr);
-
-  if (!Res.second) // Didn't emplace
-    return Res.first->second->getValue();
-
-  // Now, we need to construct the value
-  Res.first->second = ConstantInt::get(Val->getType()->getContext(), Desired);
-  return Desired;
-}
-
-void InputBuilder::build(Module &M, SmallVectorImpl<Value *> &Args) {
-  assert(NumInputArgs == Args.size() && "NumInputArgs was not properly set");
-
-  for (auto &Input : IntInputs) {
-    Value *Val = Input.first;
-    if (const Argument *Arg = dyn_cast<Argument>(Val)) {
-      assert(Arg->getArgNo() < NumInputArgs &&
-             "Inferring value for output argument?");
-      Args[Arg->getArgNo()] = Input.second;
-      continue;
-    }
-
-    GlobalVariable *GV = cast<GlobalVariable>(Val);
-    if (GV->hasInitializer()) {
-      // TODO: Should we preserve already present initializers?
-      LLVM_DEBUG(dbgs() << "XLV: overwriting initializer "
-                        << *GV->getInitializer() << "\n");
-    }
-    GV->setInitializer(Input.second);
-  }
-
-  DataLayout DL(&M);
+void InputBuilder::build(Module &M, ArrayRef<Type *> Params,
+                         SmallVectorImpl<Value *> &Args) {
   for (MemAccessRange &Range : MemRanges) {
-    uint64_t Size =
-        (Range.End - Range.Start) / DL.getTypeAllocSize(Range.ElementType) + 1;
-    ArrayType *Ty = ArrayType::get(Range.ElementType, Size);
+    ArrayType *Ty =
+        ArrayType::get(Range.ElementType, Range.End + 1 - Range.Start);
     Range.GV = new GlobalVariable(M, Ty, false, GlobalValue::PrivateLinkage,
                                   ConstantAggregateZero::get(Ty));
   }
 
-  LLVMContext &C = M.getContext();
-  Type *I64Ty = Type::getInt64Ty(C);
+  Type *I64Ty = Type::getInt64Ty(M.getContext());
   Constant *I640 = ConstantInt::get(I64Ty, 0);
-  for (auto &Access : MemAccesses) {
-    Value *Val = Access.first;
-    ArrayID RangeID = Access.second.first;
-    MemAccessRange &Range = MemRanges[RangeID];
-    GlobalVariable *GV = Range.GV;
-    assert(GV);
-    uint64_t Offset = (Access.second.second - Range.Start) /
-                      DL.getTypeAllocSize(Range.ElementType);
 
-    Constant *GEP = ConstantExpr::getInBoundsGetElementPtr(
-        GV->getValueType(), GV,
-        ArrayRef<Constant *>{I640, ConstantInt::get(I64Ty, Offset)});
+  for (unsigned I = 0, E = IntInputs.size(); I < E; ++I) {
+    Value *ArgVal;
+    if (ConstantInt *IntInput = IntInputs[I]) { // Inferred integers
+      ArgVal = IntInput;
+    } else if (MemAccesses[I]) { // Inferred pointers (now to global variables)
+      auto &Access = MemAccesses[I].getValue();
+      unsigned RangeID = Access.first;
+      MemAccessRange &Range = MemRanges[RangeID];
+      GlobalVariable *GV = Range.GV;
+      uint64_t Offset = Access.second - Range.Start;
 
-    if (const Argument *Arg = dyn_cast<Argument>(Val)) {
-      assert(Arg->getArgNo() < Args.size() &&
-             "Inferring value for output argument?");
-      Args[Arg->getArgNo()] = GEP;
-      continue;
+      ArgVal = ConstantExpr::getInBoundsGetElementPtr(
+          GV->getValueType(), GV,
+          ArrayRef<Constant *>{I640, ConstantInt::get(I64Ty, Offset)});
+    } else { // Fall back to null values
+      ArgVal = Constant::getNullValue(Params[I]);
     }
 
-    LLVM_DEBUG(
-        dbgs() << "XLV: ignoring memory access to global (not via argument) - "
-                  "is loop invariant code motion enabled?\n");
-    // TODO: should we handle this case or should we move message?
+    LLVM_DEBUG(dbgs() << "XLV: arg " << *ArgVal << "\n");
+    Args.push_back(ArgVal);
   }
 }
 
@@ -365,7 +345,7 @@ bool LoopModuleBuilder::determineIO() {
     }
   }
 
-  InferredInputs.NumInputArgs = Inputs.size();
+  InferredInputs.setNumInputArgs(Inputs.size());
 
   return true;
 }
@@ -760,21 +740,16 @@ void LoopModuleBuilder::buildMainFuncBody() {
   SmallVector<Value *> Args;
   SmallVector<Value *> CArgs;
   /* Create arguments */ {
-    assert(Inputs.size() <= LoopFuncTy->getNumParams());
-    auto *It = LoopFuncTy->param_begin();
+    unsigned NumParams = LoopFuncTy->getNumParams();
+    Args.reserve(NumParams);
+    CArgs.reserve(NumParams);
 
-    // Create input arguments
-    Args.assign(Inputs.size(), nullptr);
-    InferredInputs.build(*M, Args);
-    for (Value *&Arg : Args) {
-      if (!Arg)
-        Arg = Constant::getNullValue(*It);
-      LLVM_DEBUG(dbgs() << "XLV: arg " << *Arg << "\n");
-      ++It;
-    }
+    InferredInputs.build(*M, LoopFuncTy->params(), Args);
     CArgs = Args;
 
     // Alloc locations for output parameters
+    assert(Inputs.size() <= LoopFuncTy->getNumParams());
+    auto *It = LoopFuncTy->param_begin() + Inputs.size();
     for (auto *End = LoopFuncTy->param_end(); It != End; ++It) {
       Type *ElementType = (*It)->getNonOpaquePointerElementType();
       Args.push_back(new AllocaInst(ElementType, BenchFunc->getAddressSpace(),
@@ -1391,11 +1366,13 @@ class SCEVBackedgeTakenAnalyzer
   /// Start pointer value
   ///
   /// Currently, we only permit a single combination of a start and an end
-  /// pointer to determine the trip count.
-  Value *InferredPtrStart = nullptr;
+  /// pointer to determine the trip count.  Note that we require arguments here.
+  /// Global variables should not occur, because then the trip count should be
+  /// constant.
+  Argument *InferredPtrStart = nullptr;
 
   /// End pointer value
-  Value *InferredPtrEnd = nullptr;
+  Argument *InferredPtrEnd = nullptr;
 
   /// Difference between Start and End pointer (if present)
   uint64_t InferredPtrDiff;
@@ -1520,33 +1497,43 @@ class SCEVBackedgeTakenAnalyzer
   Optional<APInt> visitAddRecExpr(const SCEVAddRecExpr *, APInt) {
     // We should not encounter a SCEVAddRecExpr as the extracted loop is the
     // outermost loop
+    LLVM_DEBUG(dbgs() << "XLV: found SCEVAddRecExpr when analyzing backedge "
+                         "taken count\n");
     return None;
   }
 
   Optional<APInt> visitUnknown(const SCEVUnknown *Unknown, APInt Desired) {
-    Value *Val = Unknown->getValue();
-    Type *Ty = Val->getType();
+    Argument *Arg = dyn_cast<Argument>(Unknown->getValue());
+    if (!Arg) {
+      // This case should not occur.  Global variables should not occur, because
+      // then the trip count should be constant.  And in our loop function, no
+      // other values are live outside the loop.
+      LLVM_DEBUG(dbgs() << "XLV: found non-argument unknown " << Unknown
+                        << " when analyzing backedge taken count\n");
+      return None;
+    }
+    Type *Ty = Arg->getType();
 
     if (Ty->isIntegerTy())
-      return Inferred.tryAddIntInput(Val, std::move(Desired));
+      return Inferred.tryAddIntInput(Arg, std::move(Desired));
 
     assert(Ty->isPointerTy() &&
            "SCEV analysis deals with integer and pointer types only?");
 
     if (Desired.isZero()) {
       if (!InferredPtrStart) {
-        InferredPtrStart = Val;
+        InferredPtrStart = Arg;
         return Desired;
       }
-      if (InferredPtrStart == Val)
+      if (InferredPtrStart == Arg)
         return Desired;
     } else {
       if (!InferredPtrEnd) {
-        InferredPtrEnd = Val;
+        InferredPtrEnd = Arg;
         InferredPtrDiff = Desired.getZExtValue();
         return Desired;
       }
-      if (InferredPtrEnd == Val)
+      if (InferredPtrEnd == Arg)
         return Desired;
     }
 
@@ -1567,14 +1554,12 @@ public:
         Analyzer.visit(Expr, APInt(SE.getTypeSizeInBits(Expr->getType()),
                                    DesiredBackedgeTaken));
     if (Analyzer.InferredPtrStart && Analyzer.InferredPtrEnd) {
-      auto Array = Inferred.addMemAccess(Analyzer.InferredPtrStart, 0);
-      // One less than InferredPtrDiff would be enough, since the range is
-      // inclusive.  However, we'd also need to change addMemAccessForArray such
-      // that the element is not allocated there ...
-      Inferred.addMemAccess(Analyzer.InferredPtrStart,
-                            Analyzer.InferredPtrDiff);
-      Inferred.addMemAccessForArray(Analyzer.InferredPtrEnd, Array,
-                                    Analyzer.InferredPtrDiff);
+      unsigned BytesPerElement = SE.getDataLayout().getTypeAllocSize(
+          Analyzer.InferredPtrStart->getType()
+              ->getNonOpaquePointerElementType());
+      Inferred.addMemAccessWithEndptr(
+          Analyzer.InferredPtrStart, Analyzer.InferredPtrEnd,
+          Analyzer.InferredPtrDiff / BytesPerElement);
     }
     return Res;
   }
@@ -1591,7 +1576,7 @@ class SCEVMemAccessAnalyzer : private SCEVCompVisitor<SCEVMemAccessAnalyzer> {
 
   enum { NoAddRec, MonotoneAddRec, ArbitraryAddRec } AddRecKind;
 
-  Value *BasePointer = nullptr;
+  Argument *BasePointer = nullptr;
 
   Optional<APInt> visitConstant(const SCEVConstant *Constant) {
     return Constant->getAPInt();
@@ -1668,25 +1653,50 @@ class SCEVMemAccessAnalyzer : private SCEVCompVisitor<SCEVMemAccessAnalyzer> {
 
   Optional<APInt> visitUnknown(const SCEVUnknown *Unknown) {
     Value *Val = Unknown->getValue();
-    if (!isa<Argument>(Val) && !isa<GlobalVariable>(Val))
+
+    if (const GlobalVariable *GV = dyn_cast<GlobalVariable>(Val)) {
+      // All global variables have pointer type, i. e. if we have a declaration
+      // `int *global;` in C, the global variable really has type `i32**`.  If
+      // we now have an access like `global[i]`, it first loads the `i32*`
+      // stored in `global`.  This load instruction is loop invariant, so it
+      // should be moved outside the function we consider.  We would only have
+      // an `i32*` argument, which is handled below.
+      // There is an interesting case, however: If the value is of array type,
+      // then the array size could limit the number of iterations for the loop.
+
+      ArrayType *Ty = dyn_cast<ArrayType>(GV->getValueType());
+      if (!Ty) {
+        LLVM_DEBUG(
+            dbgs() << "XLV: found memory access to non-array global variable "
+                   << *GV << " - is loop invariant code motion enabled?\n");
+        return None;
+      }
+
+      // TODO: implement this
+
+      return None;
+    }
+
+    Argument *Arg = dyn_cast<Argument>(Val);
+    if (!Arg)
       return None;
 
-    Type *Ty = Val->getType();
+    Type *Ty = Arg->getType();
 
     if (IntegerType *IntTy = dyn_cast<IntegerType>(Ty))
-      return Inferred.tryAddIntInput(Val, APInt(IntTy->getBitWidth(), 1));
+      return Inferred.tryAddIntInput(Arg, APInt(IntTy->getBitWidth(), 1));
 
     assert(Ty->isPointerTy() &&
            "SCEV analysis deals with integer and pointer types only?");
 
-    if (BasePointer != Val) {
+    if (BasePointer != Arg) {
       if (BasePointer) {
         LLVM_DEBUG(dbgs() << "XLV: found two base pointers when analyzing "
                              "memory accesses\n");
         return None;
       }
 
-      BasePointer = Val;
+      BasePointer = Arg;
     }
 
     // We calculate accesses relative to the pointer
@@ -1713,14 +1723,17 @@ public:
     if (!BasePointer)
       return;
 
-    Inferred.addMemAccess(BasePointer, Res->getSExtValue());
+    unsigned BytesPerElement = SE.getDataLayout().getTypeAllocSize(
+        BasePointer->getType()->getNonOpaquePointerElementType());
+    Inferred.addMemAccess(BasePointer, Res->getSExtValue() / BytesPerElement);
 
     if (AddRecKind == NoAddRec)
       return;
 
     if (AddRecKind == MonotoneAddRec) {
       ItCurrent = ItEnd;
-      Inferred.addMemAccess(BasePointer, visit(Expr)->getSExtValue());
+      Inferred.addMemAccess(BasePointer,
+                            visit(Expr)->getSExtValue() / BytesPerElement);
       return;
     }
 
@@ -1730,7 +1743,8 @@ public:
     // iteration.
     while (ItCurrent != ItEnd) {
       ItCurrent = cast<SCEVConstant>(SE.getConstant(ItCurrent->getAPInt() + 1));
-      Inferred.addMemAccess(BasePointer, visit(Expr)->getSExtValue());
+      Inferred.addMemAccess(BasePointer,
+                            visit(Expr)->getSExtValue() / BytesPerElement);
     }
   }
 };
@@ -1765,7 +1779,7 @@ static void inferInputs(const Function &F, Loop &L, ScalarEvolution &SE,
 
         // ignore output params
         if (const Argument *Arg = dyn_cast<Argument>(Loc)) {
-          if (Arg->getArgNo() >= InferredInputs.NumInputArgs)
+          if (!InferredInputs.isInputArg(Arg))
             continue;
         }
       } else {
