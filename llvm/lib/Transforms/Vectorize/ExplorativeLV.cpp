@@ -142,8 +142,8 @@ class ExplorativeLVPass::InputBuilder {
   SmallVector<MemAccessRange> MemRanges;
 
 public:
-  void addMemAccess(Argument *Arg, int64_t Loc);
-  void addMemAccessWithEndptr(Argument *ArgStart, Argument *ArgEnd,
+  void addMemAccess(const Argument *Arg, int64_t Loc);
+  void addMemAccessWithEndptr(const Argument *ArgStart, const Argument *ArgEnd,
                               uint64_t Diff);
 
   APInt tryAddIntInput(const Argument *Arg, APInt &&Desired) {
@@ -171,7 +171,7 @@ public:
 };
 using InputBuilder = ExplorativeLVPass::InputBuilder;
 
-void InputBuilder::addMemAccess(Argument *Arg, int64_t Loc) {
+void InputBuilder::addMemAccess(const Argument *Arg, int64_t Loc) {
   auto &MemAccess = MemAccesses[Arg->getArgNo()];
   if (MemAccess) { // Already present, just extend the range (if necessary)
     MemAccessRange &Range = MemRanges[MemAccess->first];
@@ -190,7 +190,8 @@ void InputBuilder::addMemAccess(Argument *Arg, int64_t Loc) {
   }
 }
 
-void InputBuilder::addMemAccessWithEndptr(Argument *ArgStart, Argument *ArgEnd,
+void InputBuilder::addMemAccessWithEndptr(const Argument *ArgStart,
+                                          const Argument *ArgEnd,
                                           uint64_t Diff) {
   assert(ArgStart->getType() == ArgEnd->getType() && "types must agree");
   auto &MemAccessStart = MemAccesses[ArgStart->getArgNo()];
@@ -530,7 +531,7 @@ Function *LoopModuleBuilder::buildLoopFunc(unsigned VF, unsigned IF) {
   for (const Argument &OldArg : OrigFunc.args()) {
     if (VMap.count(&OldArg) == 0)
       continue;
-    if (Argument *NewArg = dyn_cast<Argument>(VMap[&OldArg])) {
+    if (const Argument *NewArg = dyn_cast<Argument>(VMap[&OldArg])) {
       LoopArgAttrs[NewArg->getArgNo()] =
           OldAttrs.getParamAttrs(OldArg.getArgNo());
     }
@@ -1374,10 +1375,10 @@ class SCEVBackedgeTakenAnalyzer
   /// pointer to determine the trip count.  Note that we require arguments here.
   /// Global variables should not occur, because then the trip count should be
   /// constant.
-  Argument *InferredPtrStart = nullptr;
+  const Argument *InferredPtrStart = nullptr;
 
   /// End pointer value
-  Argument *InferredPtrEnd = nullptr;
+  const Argument *InferredPtrEnd = nullptr;
 
   /// Difference between Start and End pointer (if present)
   uint64_t InferredPtrDiff;
@@ -1508,7 +1509,7 @@ class SCEVBackedgeTakenAnalyzer
   }
 
   Optional<APInt> visitUnknown(const SCEVUnknown *Unknown, APInt Desired) {
-    Argument *Arg = dyn_cast<Argument>(Unknown->getValue());
+    const Argument *Arg = dyn_cast<Argument>(Unknown->getValue());
     if (!Arg) {
       // This case should not occur.  Global variables should not occur, because
       // then the trip count should be constant.  And in our loop function, no
@@ -1581,7 +1582,7 @@ class SCEVMemAccessAnalyzer : private SCEVCompVisitor<SCEVMemAccessAnalyzer> {
 
   enum { NoAddRec, MonotoneAddRec, ArbitraryAddRec } AddRecKind;
 
-  Argument *BasePointer = nullptr;
+  const Argument *BasePointer = nullptr;
 
   Optional<APInt> visitConstant(const SCEVConstant *Constant) {
     return Constant->getAPInt();
@@ -1657,38 +1658,13 @@ class SCEVMemAccessAnalyzer : private SCEVCompVisitor<SCEVMemAccessAnalyzer> {
   }
 
   Optional<APInt> visitUnknown(const SCEVUnknown *Unknown) {
-    Value *Val = Unknown->getValue();
-
-    if (const GlobalVariable *GV = dyn_cast<GlobalVariable>(Val)) {
-      // All global variables have pointer type, i. e. if we have a declaration
-      // `int *global;` in C, the global variable really has type `i32**`.  If
-      // we now have an access like `global[i]`, it first loads the `i32*`
-      // stored in `global`.  This load instruction is loop invariant, so it
-      // should be moved outside the function we consider.  We would only have
-      // an `i32*` argument, which is handled below.
-      // There is an interesting case, however: If the value is of array type,
-      // then the array size could limit the number of iterations for the loop.
-
-      ArrayType *Ty = dyn_cast<ArrayType>(GV->getValueType());
-      if (!Ty) {
-        LLVM_DEBUG(
-            dbgs() << "XLV: found memory access to non-array global variable "
-                   << *GV << " - is loop invariant code motion enabled?\n");
-        return None;
-      }
-
-      // TODO: implement this
-
-      return None;
-    }
-
-    Argument *Arg = dyn_cast<Argument>(Val);
+    const Argument *Arg = dyn_cast<Argument>(Unknown->getValue());
     if (!Arg)
       return None;
 
     Type *Ty = Arg->getType();
 
-    if (IntegerType *IntTy = dyn_cast<IntegerType>(Ty))
+    if (const IntegerType *IntTy = dyn_cast<IntegerType>(Ty))
       return Inferred.tryAddIntInput(Arg, APInt(IntTy->getBitWidth(), 1));
 
     assert(Ty->isPointerTy() &&
