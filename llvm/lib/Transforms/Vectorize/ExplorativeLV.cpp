@@ -500,17 +500,15 @@ Function *LoopModuleBuilder::buildLoopFunc(unsigned VF, unsigned IF) {
 
   /* Insert the generated function arguments into the VMap, add names */ {
     auto *ArgPtr = LoopFunc->arg_begin();
-    for (const Value *OldV : Inputs) {
-      VMap[OldV] = ArgPtr;
+    for (const Value *OrigV : Inputs) {
+      VMap[OrigV] = ArgPtr;
       VMap[ArgPtr] = ArgPtr;
-      if (OldV->hasName())
-        ArgPtr->setName(OldV->getName() + ".i");
+      ArgPtr->setName(OrigV->hasName() ? OrigV->getName() + ".i" : "i");
       ++ArgPtr;
     }
     for (const Instruction *I : Outputs) {
       VMap[ArgPtr] = ArgPtr;
-      if (I->hasName())
-        ArgPtr->setName(I->getName() + ".o");
+      ArgPtr->setName(I->hasName() ? I->getName() + ".o" : "o");
       ++ArgPtr;
     }
   }
