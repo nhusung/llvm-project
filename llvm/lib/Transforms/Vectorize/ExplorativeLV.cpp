@@ -325,21 +325,26 @@ bool LoopModuleBuilder::determineIO() {
         if (OpInst) {
           if (L.getBlocksSet().contains(OpInst->getParent()))
             continue;
-        } else if (!isa<Argument>(Op) || ArgSet.contains(Op)) {
+        } else if (!isa<Argument>(Op)) {
           continue;
         }
+        if (ArgSet.contains(Op))
+          continue;
         ArgSet.insert(Op);
         Inputs.push_back(Op);
       }
 
       // Defined inside loop and used outside?
-      for (const User *U : I.users()) {
-        const Instruction *UI = dyn_cast<Instruction>(U);
-        if (!UI)
-          continue; // ignore users that aren't instructions
-        if (!L.getBlocksSet().contains(UI->getParent())) {
-          Outputs.push_back(&I);
-          break;
+      if (!ArgSet.contains(&I)) {
+        for (const User *U : I.users()) {
+          const Instruction *UI = dyn_cast<Instruction>(U);
+          if (!UI)
+            continue; // ignore users that aren't instructions
+          if (!L.getBlocksSet().contains(UI->getParent())) {
+            ArgSet.insert(&I);
+            Outputs.push_back(&I);
+            break;
+          }
         }
       }
     }
