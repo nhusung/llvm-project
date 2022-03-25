@@ -82,7 +82,7 @@ public:
       : TM(TM), PTO(PTO), PGOOpt(PGOOpt) {}
 
   ExplorativeLVPass(ExplorativeLVPass &&Pass)
-      : TM(Pass.TM), PTO(Pass.PTO), PGOOpt(Pass.PGOOpt),
+      : TM(Pass.TM), PTO(std::move(Pass.PTO)), PGOOpt(std::move(Pass.PGOOpt)),
         OptPipeline(Pass.OptPipeline), NullCGPipeline(Pass.NullCGPipeline) {
     assert(!EvaluationInfoMap && "EvaluationInfoMap present during move");
     assert(!InferredInputs && "InferredInputs present during move");
