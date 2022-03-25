@@ -67,6 +67,7 @@ private:
   struct EvaluationInfo {
     unsigned VF;
     unsigned IF;
+    unsigned UF;
     uint64_t Costs;
   };
   DenseMap<Function *, EvaluationInfo> *EvaluationInfoMap = nullptr;

@@ -88,6 +88,14 @@ static cl::opt<unsigned>
     XLVMaxIF("xlv-max-if", cl::Hidden, cl::init(8),
              cl::desc("The maximum interleaving factor to use for "
                       "explorative loop vectorization"));
+static cl::opt<unsigned>
+    XLVMaxUF("xlv-max-unroll", cl::Hidden, cl::init(8),
+             cl::desc("The maximum unroll factor to use for explorative loop "
+                      "vectorization, 0 to determine it automatically"));
+static cl::opt<unsigned> XLVMaxFullUnroll(
+    "xlv-max-full-unroll", cl::Hidden, cl::init(0),
+    cl::desc("If the loop's trip count is known and below this threshold, "
+             "explore the fully unrolled loop as well"));
 
 static cl::opt<unsigned> XLVDesiredTripCount(
     "xlv-desired-tripcount", cl::Hidden, cl::init(1024),
@@ -258,6 +266,7 @@ class LoopModuleBuilder : public ValueMaterializer {
   SmallVector<Function *> LoopFuncs;
 
   InputBuilder InferredInputs;
+  unsigned FullUnroll = 0;
 
   bool MakeExecutable;
 
@@ -277,7 +286,7 @@ public:
 
   void buildMainFuncBody();
 
-  Function *buildLoopFunc(unsigned VF, unsigned IF);
+  Function *buildLoopFunc(unsigned VF, unsigned IF, unsigned UF);
   unsigned getNumLoopFuncs() { return LoopFuncs.size(); }
   void clearLoopFuncs() {
     for (Function *LoopFunc : LoopFuncs) {
@@ -290,6 +299,7 @@ public:
     assert(M && "No loop func has been built yet");
     return InferredInputs;
   }
+  unsigned getFullUnrollCount() { return FullUnroll; }
 };
 
 bool LoopModuleBuilder::determineIO() {
@@ -450,10 +460,17 @@ Module *LoopModuleBuilder::getModule() {
   if (M)
     return M;
 
-  if (MakeExecutable &&
-      isa<SCEVCouldNotCompute>(SE.getSymbolicMaxBackedgeTakenCount(&L))) {
-    LLVM_DEBUG(dbgs() << "XLV: cannot infer trip count\n");
-    return nullptr;
+  if (MakeExecutable) {
+    const SCEV *BackedgeTaken = SE.getSymbolicMaxBackedgeTakenCount(&L);
+    if (isa<SCEVCouldNotCompute>(BackedgeTaken)) {
+      LLVM_DEBUG(dbgs() << "XLV: cannot infer trip count\n");
+      return nullptr;
+    }
+    if (const SCEVConstant *Const = dyn_cast<SCEVConstant>(BackedgeTaken)) {
+      unsigned ConstBT = Const->getAPInt().getLimitedValue(UINT_MAX - 1) + 1;
+      if (ConstBT > XLVMaxUF && ConstBT <= XLVMaxFullUnroll)
+        FullUnroll = ConstBT;
+    }
   }
 
   if (!determineIO())
@@ -482,7 +499,8 @@ Module *LoopModuleBuilder::getModule() {
 
 // This method uses a lot of code (and comments) from Utils/CloneFunction.cpp,
 // but also from IPO/LoopExtractor.cpp resp. Utils/CodeExtractor.cpp
-Function *LoopModuleBuilder::buildLoopFunc(unsigned VF, unsigned IF) {
+Function *LoopModuleBuilder::buildLoopFunc(unsigned VF, unsigned IF,
+                                           unsigned UF) {
   // Note that we actually modify the original loop here.  According to the docs
   // the metadata is attached to the branch instructions in the latches, so it
   // might be a bit difficult to directly add the metadata to the new
@@ -490,10 +508,13 @@ Function *LoopModuleBuilder::buildLoopFunc(unsigned VF, unsigned IF) {
   // explicitly for the original loop, it does not matter much anyway.
   llvm::addStringMetadataToLoop(&L, "llvm.loop.vectorize.width", VF);
   llvm::addStringMetadataToLoop(&L, "llvm.loop.interleave.count", IF);
+  if (UF)
+    llvm::addStringMetadataToLoop(&L, "llvm.loop.unroll.count", UF);
 
   Function *LoopFunc = Function::Create(
       FuncTy, GlobalValue::ExternalLinkage, OrigFunc.getAddressSpace(),
-      OrigFunc.getName() + "." + std::to_string(VF) + "." + std::to_string(IF),
+      OrigFunc.getName() + "." + Twine(VF) + "." + Twine(IF) + Twine(".") +
+          Twine(UF),
       M);
 
   LLVMContext &C = LoopFunc->getContext();
@@ -1042,45 +1063,71 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, ScalarEvolution &SE,
 
   unsigned BestVF = 1;
   unsigned BestIF = 1;
+  unsigned BestUF = 0;
   uint64_t MinCosts = InvalidCosts;
 
-  auto UpdateBest = [&BestVF, &BestIF, &MinCosts](unsigned VF, unsigned IF,
-                                                  uint64_t Costs) {
+  auto UpdateBest = [&BestVF, &BestIF, &BestUF, &MinCosts](
+                        unsigned VF, unsigned IF, unsigned UF, uint64_t Costs) {
     if (Costs == ExplorativeLVPass::InvalidCosts) {
-      LLVM_DEBUG(dbgs() << "XLV: invalid costs for VF " << VF << ", IF " << IF
-                        << "\n");
+      LLVM_DEBUG(dbgs() << "XLV: costs for VF " << VF << ", IF " << IF
+                        << ", UF " << UF << ": (invalid)\n");
       return;
     }
 
     if (XLVDivVF)
       Costs /= VF;
 
-    LLVM_DEBUG(dbgs() << "XLV: costs for VF " << VF << ", IF " << IF << ": "
-                      << Costs << "\n");
+    LLVM_DEBUG(dbgs() << "XLV: costs for VF " << VF << ", IF " << IF << ", UF "
+                      << UF << ": " << Costs << '\n');
 
     if (Costs < MinCosts) {
       MinCosts = Costs;
       BestVF = VF;
       BestIF = IF;
-    } else if (Costs == MinCosts && (VF == 1 || VF >= BestVF) && IF >= BestIF) {
+      BestUF = UF;
+    } else if (Costs == MinCosts && (VF == 1 || VF >= BestVF) && IF >= BestIF &&
+               UF <= BestUF) {
       // If costs are equal to costs retrieved before, always choose the
-      // higher VF-IF combination unless best VF is scalar.
+      // higher VF-IF combination unless best VF is scalar.  We always choose
+      // the lower UF for the sake of smaller code size.
       BestVF = VF;
       BestIF = IF;
+      BestUF = UF;
     }
+  };
+
+  auto ForeachFactor = [FullUnroll = Builder.getFullUnrollCount()](auto Body) {
+    for (unsigned VF = 1; VF <= XLVMaxVF; VF *= 2) {
+      for (unsigned IF = 1; IF <= XLVMaxIF; IF *= 2) {
+        if (XLVMaxUF == 0) {
+          if (Body(VF, IF, 0))
+            return true;
+          continue;
+        }
+        for (unsigned UF = 1; UF <= XLVMaxUF; UF *= 2) {
+          if (Body(VF, IF, UF))
+            return true;
+        }
+        if (FullUnroll) {
+          if (Body(VF, IF, FullUnroll))
+            return true;
+        }
+      }
+    }
+    return false;
   };
 
   if (XLVMetric == Metric::InstCount) {
     DenseMap<Function *, EvaluationInfo> ResultMap;
     EvaluationInfoMap = &ResultMap;
 
-    // Build a module containing functions for all VF/IF combinations
-    for (unsigned VF = 1; VF <= XLVMaxVF; VF *= 2) {
-      for (unsigned IF = 1; IF <= XLVMaxIF; IF *= 2) {
-        Function *Func = Builder.buildLoopFunc(VF, IF);
-        ResultMap[Func] = {VF, IF, InvalidCosts};
-      }
-    }
+    // Build a module containing functions for all VF/IF/UF combinations
+    ForeachFactor(
+        [&Builder, &ResultMap](unsigned VF, unsigned IF, unsigned UF) {
+          Function *Func = Builder.buildLoopFunc(VF, IF, UF);
+          ResultMap[Func] = {VF, IF, UF, InvalidCosts};
+          return false; // continue
+        });
 
     // Run pipelines
     OptPipeline->run(*M);
@@ -1088,47 +1135,47 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, ScalarEvolution &SE,
 
     for (auto &KV : ResultMap) {
       EvaluationInfo &Info = KV.second;
-      UpdateBest(Info.VF, Info.IF, Info.Costs);
+      UpdateBest(Info.VF, Info.IF, Info.UF, Info.Costs);
     }
 
     EvaluationInfoMap = nullptr;
   } else if (XLVMetric == Metric::MCA) {
-    // Try out which VF works best for this loop
-    for (unsigned VF = 1; VF <= XLVMaxVF; VF *= 2) {
-      for (unsigned IF = 1; IF <= XLVMaxIF; IF *= 2) {
-        Builder.buildLoopFunc(VF, IF);
-        OptPipeline->run(*M);
+    ForeachFactor([this, &Builder, M, TLI,
+                   &UpdateBest](unsigned VF, unsigned IF, unsigned UF) {
+      Builder.buildLoopFunc(VF, IF, UF);
+      OptPipeline->run(*M);
 
-        // Expensive, but: If we are using llvm-mca for evaluation, we need
-        // a new backend pipeline for each iteration as the print stream is
-        // dead after one use
-        int ASMFD;
-        SmallString<32> ASMPath;
-        sys::fs::createTemporaryFile("explorative-lv", "s", ASMFD, ASMPath);
-        FileRemover ASMRemover(ASMPath);
-        {
-          raw_fd_ostream OS(ASMFD, true);
-          legacy::PassManager CGPipeline;
-          initCodeGen(CGPipeline, *TM, this, TLI, OS, CGFT_AssemblyFile);
-          CGPipeline.run(*M);
-        }
-        // Perform the cost calculation after the pipeline is deleted, to make
-        // sure the assembly printer has finished
-        uint64_t Costs = performMCACostCalc(ASMPath, TM->getTargetCPU(),
-                                            M->getTargetTriple());
-        UpdateBest(VF, IF, Costs);
-
-        Builder.clearLoopFuncs();
+      // Expensive, but: If we are using llvm-mca for evaluation, we need a new
+      // backend pipeline for each iteration as the print stream is dead after
+      // one use
+      int ASMFD;
+      SmallString<32> ASMPath;
+      sys::fs::createTemporaryFile("explorative-lv", "s", ASMFD, ASMPath);
+      FileRemover ASMRemover(ASMPath);
+      {
+        raw_fd_ostream OS(ASMFD, true);
+        legacy::PassManager CGPipeline;
+        initCodeGen(CGPipeline, *TM, this, TLI, OS, CGFT_AssemblyFile);
+        CGPipeline.run(*M);
       }
-    }
+      // Perform the cost calculation after the pipeline is deleted, to make
+      // sure the assembly printer has finished
+      uint64_t Costs =
+          performMCACostCalc(ASMPath, TM->getTargetCPU(), M->getTargetTriple());
+      UpdateBest(VF, IF, 0, Costs);
+
+      Builder.clearLoopFuncs();
+
+      return false; // continue;
+    });
   } else {
     assert(XLVMetric == Metric::Benchmark);
 
-    // Build a module containing functions for all VF/IF combinations
-    for (unsigned VF = 1; VF <= XLVMaxVF; VF *= 2) {
-      for (unsigned IF = 1; IF <= XLVMaxIF; IF *= 2)
-        Builder.buildLoopFunc(VF, IF);
-    }
+    // Build a module containing functions for all VF/IF/UF combinations
+    ForeachFactor([&Builder](unsigned VF, unsigned IF, unsigned UF) {
+      Builder.buildLoopFunc(VF, IF, UF);
+      return false; // continue
+    });
 
     // Get a reference to the inferred inputs vector.  The ExplorativeLVPass in
     // the optimization pipeline will (try to) infer the arguments.
@@ -1203,7 +1250,7 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, ScalarEvolution &SE,
     StringRef BenchRes = BenchResBuf.get()->getBuffer();
 
     // Read calibration info
-    bool ReadFailed = [&BenchRes, &UpdateBest]() {
+    bool ReadFailed = [&BenchRes, &ForeachFactor, &UpdateBest]() {
       uint64_t CalibTime;
       if (BenchRes.consumeInteger(10, CalibTime))
         return true;
@@ -1215,17 +1262,18 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, ScalarEvolution &SE,
                         << " ticks, executed each loop function "
                         << XLVBenchmarkLoopSize * NRuns << " times\n");
 
-      for (unsigned VF = 1; VF <= XLVMaxVF; VF *= 2) {
-        for (unsigned IF = 1; IF <= XLVMaxIF; IF *= 2) {
-          BenchRes = BenchRes.drop_front(); // drop '\n'
+      ForeachFactor(
+          [&BenchRes, &UpdateBest](unsigned VF, unsigned IF, unsigned UF) {
+            BenchRes = BenchRes.drop_front(); // drop '\n'
 
-          uint64_t Costs;
-          if (BenchRes.consumeInteger(10, Costs))
-            return true;
+            uint64_t Costs;
+            if (BenchRes.consumeInteger(10, Costs))
+              return true; // break (error)
 
-          UpdateBest(VF, IF, Costs);
-        }
-      }
+            UpdateBest(VF, IF, UF, Costs);
+            return false; // continue
+          });
+
       return false;
     }();
     if (ReadFailed) {
@@ -1239,10 +1287,12 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, ScalarEvolution &SE,
 
   // Force the vectorizer to use the VF and IF that showed to have the lowest
   // cost
-  LLVM_DEBUG(dbgs() << "XLV: choosing this VF and IF for vectorization: "
-                    << BestVF << " and " << BestIF << "\n");
+  LLVM_DEBUG(dbgs() << "XLV: choosing VF " << BestVF << ", IF " << BestIF
+                    << ", UF " << BestUF << '\n');
   addStringMetadataToLoop(&L, "llvm.loop.vectorize.width", BestVF);
   addStringMetadataToLoop(&L, "llvm.loop.interleave.count", BestIF);
+  if (BestUF != 0)
+    addStringMetadataToLoop(&L, "llvm.loop.unroll.count", BestUF);
 
   return false; // no errors
 }
@@ -1835,6 +1885,8 @@ PreservedAnalyses ExplorativeLVPass::run(Function &F,
                            "AutoVectorizer determine VF and IF\n");
       addStringMetadataToLoop(L, "llvm.loop.vectorize.width", 0);
       addStringMetadataToLoop(L, "llvm.loop.interleave.count", 0);
+      if (XLVMaxUF)
+        addStringMetadataToLoop(L, "llvm.loop.unroll.count", 0);
     }
   } while (!Worklist.empty());
 
