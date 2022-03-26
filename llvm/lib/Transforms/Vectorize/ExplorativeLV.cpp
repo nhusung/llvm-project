@@ -80,6 +80,13 @@ cl::opt<bool> XLVPlain("xlv-plain", cl::Hidden, cl::init(false),
 
 } // namespace llvm
 
+namespace {
+enum class XLVClockid {
+  MONOTONIC = CLOCK_MONOTONIC,
+  PROCESS_CPUTIME_ID = CLOCK_PROCESS_CPUTIME_ID
+};
+} // end anonymous namespace
+
 static cl::opt<unsigned>
     XLVMaxVF("xlv-max-vf", cl::Hidden, cl::init(16),
              cl::desc("The maximum vectorization factor to use for "
@@ -103,12 +110,13 @@ static cl::opt<unsigned> XLVDesiredTripCount(
 static cl::opt<uint64_t> XLVBenchmarkUSecs(
     "xlv-benchmark-usecs", cl::Hidden, cl::init(100000),
     cl::desc("In benchmarking mode: microseconds for calibration run"));
-static cl::opt<clockid_t> XLVBenchmarkClockid(
+static cl::opt<XLVClockid> XLVBenchmarkClockid(
     "xlv-benchmark-clock", cl::Hidden,
     cl::desc("In benchmarking mode: clock to use, see clock_gettime(3)"),
-    cl::init(CLOCK_MONOTONIC),
-    cl::values(clEnumValN(CLOCK_MONOTONIC, "monotonic", "CLOCK_MONOTONIC"),
-               clEnumValN(CLOCK_PROCESS_CPUTIME_ID, "process",
+    cl::init(XLVClockid::MONOTONIC),
+    cl::values(clEnumValN(XLVClockid::MONOTONIC, "monotonic",
+                          "CLOCK_MONOTONIC"),
+               clEnumValN(XLVClockid::PROCESS_CPUTIME_ID, "process",
                           "CLOCK_PROCESS_CPUTIME_ID")));
 static cl::opt<unsigned> XLVBenchmarkWarmup(
     "xlv-benchmark-warmup", cl::Hidden, cl::init(16),
@@ -736,7 +744,8 @@ void LoopModuleBuilder::buildMainFuncBody() {
   Constant *TimespecNSecIndex = ConstantInt::get(I32Ty, 1);
   Constant *I640 = ConstantInt::get(I64Ty, 0);
   Constant *Nanos = ConstantInt::get(I64Ty, 1000000000);
-  Constant *Clockid = ConstantInt::get(ClockidTy, XLVBenchmarkClockid);
+  Constant *Clockid =
+      ConstantInt::get(ClockidTy, (uint64_t)XLVBenchmarkClockid.getValue());
 
   assert(LoopFuncs.size() > 0 && "No loop functions generated yet");
   FunctionType *LoopFuncTy = LoopFuncs[0]->getFunctionType();
