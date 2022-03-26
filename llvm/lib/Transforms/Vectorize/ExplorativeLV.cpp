@@ -1271,7 +1271,9 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, ScalarEvolution &SE,
     FileRemover ExecRemover(ExecPath);
     if (sys::ExecuteAndWait(CCPath.get(), {"cc", "-o", ExecPath, ObjectPath}) !=
         0) {
-      errs() << "XLV: linking failed\n";
+      errs() << "XLV: linking failed.  You can find the object file at "
+             << ObjectPath << '\n';
+      ObjectRemover.releaseFile();
       return true;
     }
 
@@ -1290,7 +1292,7 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, ScalarEvolution &SE,
     if (RetCode == -2) {
       errs()
           << "XLV: benchmarking failed/timed out.  You can find the binary at "
-          << ExecPath << "\n";
+          << ExecPath << '\n';
       ExecRemover.releaseFile();
       return true;
     }
