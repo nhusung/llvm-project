@@ -1278,9 +1278,9 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, ScalarEvolution &SE,
     }
 
     // Do the benchmarking
+    // Timout: ceil(2 * (calib_secs + n * bench_secs)))
     unsigned TimeoutS =
-        1 + 2 * ((Builder.getNumLoopFuncs() + 1) * XLVBenchmarkUSecs) /
-                CLOCKS_PER_SEC; // ceil(2 * (calib_secs + n * bench_secs))
+        1 + 2 * (Builder.getNumLoopFuncs() + 1) * XLVBenchmarkUSecs / 1000000;
     LLVM_DEBUG(dbgs() << "XLV: benchmarking for up to " << TimeoutS
                       << " s ...\n");
     SmallString<32> BenchResPath;
