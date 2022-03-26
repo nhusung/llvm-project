@@ -100,11 +100,16 @@ static cl::opt<unsigned> XLVMaxFullUnroll(
 static cl::opt<unsigned> XLVDesiredTripCount(
     "xlv-desired-tripcount", cl::Hidden, cl::init(1024),
     cl::desc("In benchmarking mode: try to run the loop with this trip count"));
-static cl::opt<uint64_t>
-    XLVBenchmarkTicks("xlv-benchmark-ticks", cl::Hidden,
-                      cl::init(CLOCKS_PER_SEC / 10),
-                      cl::desc("In benchmarking mode: use this number of "
-                               "clock ticks for calibration"));
+static cl::opt<uint64_t> XLVBenchmarkUSecs(
+    "xlv-benchmark-usecs", cl::Hidden, cl::init(100000),
+    cl::desc("In benchmarking mode: microseconds for calibration run"));
+static cl::opt<clockid_t> XLVBenchmarkClockid(
+    "xlv-benchmark-clock", cl::Hidden,
+    cl::desc("In benchmarking mode: clock to use, see clock_gettime(3)"),
+    cl::init(CLOCK_MONOTONIC),
+    cl::values(clEnumValN(CLOCK_MONOTONIC, "monotonic", "CLOCK_MONOTONIC"),
+               clEnumValN(CLOCK_PROCESS_CPUTIME_ID, "process",
+                          "CLOCK_PROCESS_CPUTIME_ID")));
 static cl::opt<unsigned> XLVBenchmarkWarmup(
     "xlv-benchmark-warmup", cl::Hidden, cl::init(16),
     cl::desc("In benchmarking mode: how many times to call each loop function "
@@ -715,26 +720,37 @@ void LoopModuleBuilder::buildMainFuncBody() {
   LLVMContext &C = M->getContext();
 
   // Some types and values we will use a few times
+  Type *IntTy = Type::getIntNTy(C, sizeof(int) * 8);
   Type *I32Ty = Type::getInt32Ty(C);
   Type *I64Ty = Type::getInt64Ty(C);
-  Constant *I320 = ConstantInt::get(I32Ty, 0);
-  Constant *I321 = ConstantInt::get(I32Ty, 1);
+  Type *ClockidTy = Type::getIntNTy(C, sizeof(clockid_t) * 8);
+  static_assert(sizeof(time_t) <= 8, "time_t larger than expected");
+  Type *TimeTy = Type::getIntNTy(C, sizeof(time_t) * 8);
+  static_assert(sizeof(long) <= 8, "long larger than expected");
+  Type *LongTy = Type::getIntNTy(C, sizeof(long) * 8);
+  Type *TimespecTy = StructType::create({TimeTy, LongTy}, "struct.timespec");
+  Type *TimespecPtrTy = PointerType::get(TimespecTy, 0);
+  Constant *Int0 = ConstantInt::get(IntTy, 0);
+  Constant *Int1 = ConstantInt::get(IntTy, 1);
+  Constant *TimespecSecIndex = ConstantInt::get(I32Ty, 0);
+  Constant *TimespecNSecIndex = ConstantInt::get(I32Ty, 1);
   Constant *I640 = ConstantInt::get(I64Ty, 0);
+  Constant *Nanos = ConstantInt::get(I64Ty, 1000000000);
+  Constant *Clockid = ConstantInt::get(ClockidTy, XLVBenchmarkClockid);
 
   assert(LoopFuncs.size() > 0 && "No loop functions generated yet");
   FunctionType *LoopFuncTy = LoopFuncs[0]->getFunctionType();
   PointerType *LoopFuncPtrTy = LoopFuncs[0]->getType();
 
-  // Declare `clock_t clock(void)`
-  static_assert(sizeof(clock_t) == 8, "clock_t is assumed to be 64 bit");
-  FunctionType *ClockFuncTy = FunctionType::get(I64Ty, false);
-  Function *ClockFunc =
-      Function::Create(ClockFuncTy, GlobalValue::ExternalLinkage,
-                       OrigFunc.getAddressSpace(), "clock", M);
+  // Declare `int clock_gettime(clockid_t clock_id, struct timespec *res)`
+  FunctionType *ClockGettimeFuncTy =
+      FunctionType::get(IntTy, {ClockidTy, TimespecPtrTy}, false);
+  Function *ClockGettimeFunc = Function::Create(
+      ClockGettimeFuncTy, GlobalValue::ExternalLinkage, 0, "clock_gettime", M);
 
   // Declare `int printf(char *format, ...)`
   FunctionType *PrintfFuncTy =
-      FunctionType::get(I32Ty, {Type::getInt8PtrTy(C)}, true);
+      FunctionType::get(IntTy, {Type::getInt8PtrTy(C)}, true);
   Function *PrintfFunc =
       Function::Create(PrintfFuncTy, GlobalValue::ExternalLinkage,
                        OrigFunc.getAddressSpace(), "printf", M);
@@ -745,10 +761,10 @@ void LoopModuleBuilder::buildMainFuncBody() {
   // To infer a suitable n, we build a calibration function that counts the
   // repitions needed until the elapsed time exceeds some threshold.
   FunctionType *BenchFuncTy =
-      FunctionType::get(Type::getVoidTy(C), {LoopFuncPtrTy, I32Ty}, false);
+      FunctionType::get(Type::getVoidTy(C), {LoopFuncPtrTy, IntTy}, false);
   Function *BenchFunc =
       Function::Create(BenchFuncTy, GlobalValue::PrivateLinkage, "bench", M);
-  FunctionType *CalibFuncTy = FunctionType::get(I32Ty, {LoopFuncPtrTy}, false);
+  FunctionType *CalibFuncTy = FunctionType::get(IntTy, {LoopFuncPtrTy}, false);
   Function *CalibFunc =
       Function::Create(CalibFuncTy, GlobalValue::PrivateLinkage, "calib", M);
 
@@ -772,7 +788,7 @@ void LoopModuleBuilder::buildMainFuncBody() {
     InferredInputs.build(*M, LoopFuncTy->params(), Args);
     CArgs = Args;
 
-    // Alloc locations for output parameters
+    // Allocate locations for output parameters
     assert(Inputs.size() <= LoopFuncTy->getNumParams());
     auto *It = LoopFuncTy->param_begin() + Inputs.size();
     for (auto *End = LoopFuncTy->param_end(); It != End; ++It) {
@@ -784,6 +800,12 @@ void LoopModuleBuilder::buildMainFuncBody() {
     }
   }
 
+  // Allocate timespec structs
+  AllocaInst *TStartVar = new AllocaInst(TimespecTy, 0, "ts", StartBB);
+  AllocaInst *TEndVar = new AllocaInst(TimespecTy, 0, "te", StartBB);
+  AllocaInst *CTStartVar = new AllocaInst(TimespecTy, 0, "ts", CStartBB);
+  AllocaInst *CTEndVar = new AllocaInst(TimespecTy, 0, "te", CStartBB);
+
   // Warmup
   for (unsigned I = 0; I < XLVBenchmarkWarmup; ++I) {
     CallInst::Create(LoopFuncTy, FuncArg, Args, "", StartBB);
@@ -791,19 +813,52 @@ void LoopModuleBuilder::buildMainFuncBody() {
   }
 
   // Start measuring
-  CallInst *TStart = CallInst::Create(ClockFuncTy, ClockFunc, "ts", StartBB);
-  CallInst *CTStart = CallInst::Create(ClockFuncTy, ClockFunc, "ts", CStartBB);
+  CallInst::Create(ClockGettimeFuncTy, ClockGettimeFunc, {Clockid, TStartVar},
+                   "", StartBB);
+  CallInst::Create(ClockGettimeFuncTy, ClockGettimeFunc, {Clockid, CTStartVar},
+                   "", CStartBB);
+
+  auto TimeDiff = [=](AllocaInst *StartVar, AllocaInst *EndVar,
+                      BasicBlock *BB) {
+    CallInst::Create(ClockGettimeFuncTy, ClockGettimeFunc, {Clockid, EndVar},
+                     "", BB);
+
+    GetElementPtrInst *Ptr = GetElementPtrInst::CreateInBounds(
+        TimespecTy, EndVar, {I640, TimespecSecIndex}, "te.sec_ptr", BB);
+    Value *EndSec = new LoadInst(TimeTy, Ptr, "te.sec", BB);
+    Ptr = GetElementPtrInst::CreateInBounds(
+        TimespecTy, StartVar, {I640, TimespecSecIndex}, "ts.sec_ptr", BB);
+    Value *StartSec = new LoadInst(TimeTy, Ptr, "ts.sec", BB);
+    Value *DiffSec = BinaryOperator::CreateSub(EndSec, StartSec, "td.sec", BB);
+    if (sizeof(time_t) < 8)
+      DiffSec = new ZExtInst(DiffSec, I64Ty, "td.sec64", BB);
+    Value *DiffNSec = BinaryOperator::CreateMul(DiffSec, Nanos, "", BB);
+
+    Ptr = GetElementPtrInst::CreateInBounds(
+        TimespecTy, EndVar, {I640, TimespecNSecIndex}, "te.nsec_ptr", BB);
+    Value *EndNSec = new LoadInst(LongTy, Ptr, "te.nsec", BB);
+    if (sizeof(long) < 8)
+      EndNSec = new ZExtInst(EndNSec, I64Ty, "te.nsec64", BB);
+    DiffNSec = BinaryOperator::CreateAdd(DiffNSec, EndNSec, "", BB);
+
+    Ptr = GetElementPtrInst::CreateInBounds(
+        TimespecTy, StartVar, {I640, TimespecNSecIndex}, "ts.nsec_ptr", BB);
+    Value *StartNSec = new LoadInst(LongTy, Ptr, "ts.nsec", BB);
+    if (sizeof(long) < 8)
+      StartNSec = new ZExtInst(EndNSec, I64Ty, "te.nsec64", BB);
+    return BinaryOperator::CreateSub(DiffNSec, StartNSec, "td", BB);
+  };
 
   // Benchmarking loop
   BasicBlock *LoopBB = BasicBlock::Create(C, "bench_loop", BenchFunc);
   BranchInst::Create(LoopBB, StartBB);
-  PHINode *CountPhi = PHINode::Create(I32Ty, 2, "counter", LoopBB);
-  CountPhi->addIncoming(I321, StartBB);
+  PHINode *CountPhi = PHINode::Create(IntTy, 2, "counter", LoopBB);
+  CountPhi->addIncoming(Int1, StartBB);
 
   BasicBlock *CLoopBB = BasicBlock::Create(C, "calib_loop", CalibFunc);
   BranchInst::Create(CLoopBB, CStartBB);
-  PHINode *CCountPhi = PHINode::Create(I32Ty, 2, "counter", CLoopBB);
-  CCountPhi->addIncoming(I321, CStartBB);
+  PHINode *CCountPhi = PHINode::Create(IntTy, 2, "counter", CLoopBB);
+  CCountPhi->addIncoming(Int1, CStartBB);
 
   for (unsigned I = 0; I < XLVBenchmarkLoopSize; ++I) {
     CallInst::Create(LoopFuncTy, FuncArg, Args, "", LoopBB);
@@ -813,16 +868,14 @@ void LoopModuleBuilder::buildMainFuncBody() {
   // Counters and exit conditions
   ICmpInst *ContLoop = new ICmpInst(*LoopBB, CmpInst::ICMP_EQ, CountPhi, NArg);
   BinaryOperator *CountAdd =
-      BinaryOperator::CreateAdd(CountPhi, I321, "counter_next", LoopBB);
+      BinaryOperator::CreateAdd(CountPhi, Int1, "counter_next", LoopBB);
 
-  CallInst *CTNow = CallInst::Create(ClockFuncTy, ClockFunc, "tn", CLoopBB);
-  BinaryOperator *CTDiff =
-      BinaryOperator::CreateSub(CTNow, CTStart, "dt", CLoopBB);
+  Value *CTDiff = TimeDiff(CTStartVar, CTEndVar, CLoopBB);
   ICmpInst *CContLoop =
       new ICmpInst(*CLoopBB, CmpInst::ICMP_ULT, CTDiff,
-                   ConstantInt::get(I64Ty, XLVBenchmarkTicks));
+                   ConstantInt::get(I64Ty, 1000 * XLVBenchmarkUSecs));
   BinaryOperator *CCountAdd =
-      BinaryOperator::CreateAdd(CCountPhi, I321, "counter_next", CLoopBB);
+      BinaryOperator::CreateAdd(CCountPhi, Int1, "counter_next", CLoopBB);
 
   // Branch at the end of the loop
   BasicBlock *EvalBB = BasicBlock::Create(C, "bench_eval", BenchFunc);
@@ -834,13 +887,9 @@ void LoopModuleBuilder::buildMainFuncBody() {
   CCountPhi->addIncoming(CCountAdd, CLoopBB);
 
   // Stop measuring
-  CallInst *TEnd = CallInst::Create(ClockFuncTy, ClockFunc, "te", EvalBB);
-  BinaryOperator *TDiff = BinaryOperator::CreateSub(TEnd, TStart, "dt", EvalBB);
+  Value *TDiff = TimeDiff(TStartVar, TEndVar, EvalBB);
 
   // Create format strings
-  static_assert(sizeof(unsigned long long) == 8,
-                "unsigned long long is expected to be 64 bit");
-  static_assert(sizeof(unsigned) == 4, "unsigned is expected to be 32 bit");
   Constant *FormatStr = ConstantDataArray::getString(C, "%llu\n");
   Constant *CFormatStr = ConstantDataArray::getString(C, "%llu %u\n");
   GlobalVariable *FormatStrGV =
@@ -866,7 +915,7 @@ void LoopModuleBuilder::buildMainFuncBody() {
 
   // Declare & define `int main(void)`
   Function *MainFunc = Function::Create(
-      FunctionType::get(I32Ty, false), GlobalValue::ExternalLinkage, "main", M);
+      FunctionType::get(IntTy, false), GlobalValue::ExternalLinkage, "main", M);
 
   BasicBlock *MainBB = BasicBlock::Create(C, "main", MainFunc);
   CallInst *NRuns =
@@ -874,7 +923,7 @@ void LoopModuleBuilder::buildMainFuncBody() {
   for (Function *LoopFunc : LoopFuncs)
     CallInst::Create(BenchFuncTy, BenchFunc, {LoopFunc, NRuns}, "", MainBB);
 
-  ReturnInst::Create(C, I320, MainBB);
+  ReturnInst::Create(C, Int0, MainBB);
 }
 
 } // end anonymous namespace
@@ -1219,7 +1268,7 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, ScalarEvolution &SE,
 
     // Do the benchmarking
     unsigned TimeoutS =
-        1 + 2 * ((Builder.getNumLoopFuncs() + 1) * XLVBenchmarkTicks) /
+        1 + 2 * ((Builder.getNumLoopFuncs() + 1) * XLVBenchmarkUSecs) /
                 CLOCKS_PER_SEC; // ceil(2 * (calib_secs + n * bench_secs))
     LLVM_DEBUG(dbgs() << "XLV: benchmarking for up to " << TimeoutS
                       << " s ...\n");
@@ -1259,7 +1308,7 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, ScalarEvolution &SE,
       if (BenchRes.consumeInteger(10, NRuns))
         return true;
       LLVM_DEBUG(dbgs() << "XLV: calibration run took " << CalibTime
-                        << " ticks, executed each loop function "
+                        << " ns, executed each loop function "
                         << XLVBenchmarkLoopSize * NRuns << " times\n");
 
       ForeachFactor(
