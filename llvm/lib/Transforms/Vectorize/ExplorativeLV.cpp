@@ -53,7 +53,9 @@
 #include "llvm/Support/Program.h"
 #include "llvm/Transforms/ObjCARC.h"
 #include "llvm/Transforms/Utils/Cloning.h"
+#include <algorithm>
 #include <ctime>
+#include <random>
 
 using namespace llvm;
 #define DEBUG_TYPE "explorative-lv"
@@ -127,6 +129,9 @@ static cl::opt<unsigned>
     XLVBenchmarkLoopSize("xlv-benchmark-loop-size", cl::Hidden, cl::init(32),
                          cl::desc("In benchmarking mode: size (loop "
                                   "function calls) of the benchmark loop"));
+static cl::opt<bool> XLVBenchmarkRandOrder(
+    "xlv-benchmark-rand-order", cl::Hidden, cl::init(false),
+    cl::desc("In benchmarking mode: randomize the loop order"));
 static cl::opt<bool>
     XLVBenchmarkKeepExec("xlv-benchmark-keep-exec", cl::Hidden, cl::init(false),
                          cl::desc("In benchmarking mode: keep the executable"));
@@ -280,6 +285,7 @@ class LoopModuleBuilder : public ValueMaterializer {
   SmallVector<const Value *> Inputs;
   SmallVector<const Instruction *> Outputs;
   FunctionType *FuncTy;
+  Function *RefLoopFunc = nullptr;
   SmallVector<Function *> LoopFuncs;
 
   InputBuilder InferredInputs;
@@ -735,6 +741,8 @@ Function *LoopModuleBuilder::buildLoopFunc(unsigned VF, unsigned IF,
     dbgs() << *LoopFunc << '\n';
 
   LoopFuncs.push_back(LoopFunc);
+  if (VF == 1 && IF == 1 && UF <= 1)
+    RefLoopFunc = LoopFunc;
   return LoopFunc;
 }
 
@@ -761,9 +769,9 @@ void LoopModuleBuilder::buildMainFuncBody() {
   Constant *Clockid =
       ConstantInt::get(ClockidTy, (uint64_t)XLVBenchmarkClockid.getValue());
 
-  assert(LoopFuncs.size() > 0 && "No loop functions generated yet");
-  FunctionType *LoopFuncTy = LoopFuncs[0]->getFunctionType();
-  PointerType *LoopFuncPtrTy = LoopFuncs[0]->getType();
+  assert(RefLoopFunc && "Must generate a function with VF 1, IF 1 and UF 0/1");
+  FunctionType *LoopFuncTy = RefLoopFunc->getFunctionType();
+  PointerType *LoopFuncPtrTy = RefLoopFunc->getType();
 
   // Declare `int clock_gettime(clockid_t clock_id, struct timespec *res)`
   FunctionType *ClockGettimeFuncTy =
@@ -942,7 +950,7 @@ void LoopModuleBuilder::buildMainFuncBody() {
 
   BasicBlock *MainBB = BasicBlock::Create(C, "main", MainFunc);
   CallInst *NRuns =
-      CallInst::Create(CalibFuncTy, CalibFunc, {LoopFuncs[0]}, "n", MainBB);
+      CallInst::Create(CalibFuncTy, CalibFunc, {RefLoopFunc}, "n", MainBB);
   for (Function *LoopFunc : LoopFuncs)
     CallInst::Create(BenchFuncTy, BenchFunc, {LoopFunc, NRuns}, "", MainBB);
 
@@ -1172,34 +1180,30 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, ScalarEvolution &SE,
     for (unsigned VF = 1; VF <= XLVMaxVF; VF *= 2) {
       for (unsigned IF = 1; IF <= XLVMaxIF; IF *= 2) {
         if (XLVMaxUF == 0) {
-          if (Body(VF, IF, 0))
-            return true;
+          Body(VF, IF, 0);
           continue;
         }
-        for (unsigned UF = 1; UF <= XLVMaxUF; UF *= 2) {
-          if (Body(VF, IF, UF))
-            return true;
-        }
-        if (FullUnroll) {
-          if (Body(VF, IF, FullUnroll))
-            return true;
-        }
+        for (unsigned UF = 1; UF <= XLVMaxUF; UF *= 2)
+          Body(VF, IF, UF);
+        if (FullUnroll)
+          Body(VF, IF, FullUnroll);
       }
     }
-    return false;
   };
 
   if (XLVMetric == Metric::InstCount) {
     DenseMap<Function *, EvaluationInfo> ResultMap;
     EvaluationInfoMap = &ResultMap;
 
-    // Build a module containing functions for all VF/IF/UF combinations
-    ForeachFactor(
-        [&Builder, &ResultMap](unsigned VF, unsigned IF, unsigned UF) {
-          Function *Func = Builder.buildLoopFunc(VF, IF, UF);
-          ResultMap[Func] = {VF, IF, UF, InvalidCosts};
-          return false; // continue
-        });
+    // Build a module containing functions for all VF/IF combinations.  We only
+    // consider UF 1, everything else is not interesting when counting
+    // instructions.
+    for (unsigned VF = 1; VF <= XLVMaxVF; VF *= 2) {
+      for (unsigned IF = 1; IF <= XLVMaxIF; IF *= 2) {
+        Function *Func = Builder.buildLoopFunc(VF, IF, 1);
+        ResultMap[Func] = {VF, IF, 1, InvalidCosts};
+      }
+    }
 
     // Run pipelines
     OptPipeline->run(*M);
@@ -1244,10 +1248,18 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, ScalarEvolution &SE,
     assert(XLVMetric == Metric::Benchmark);
 
     // Build a module containing functions for all VF/IF/UF combinations
-    ForeachFactor([&Builder](unsigned VF, unsigned IF, unsigned UF) {
-      Builder.buildLoopFunc(VF, IF, UF);
-      return false; // continue
+    SmallVector<std::tuple<unsigned, unsigned, unsigned>> Factors;
+    ForeachFactor([&Factors](unsigned VF, unsigned IF, unsigned UF) {
+      Factors.emplace_back(VF, IF, UF);
     });
+    if (XLVBenchmarkRandOrder) {
+      std::random_device RD;
+      std::default_random_engine RNG(RD());
+      std::shuffle(Factors.begin(), Factors.end(), RNG);
+    }
+
+    for (auto &Fs : Factors)
+      Builder.buildLoopFunc(std::get<0>(Fs), std::get<1>(Fs), std::get<2>(Fs));
 
     // Get a reference to the inferred inputs vector.  The ExplorativeLVPass in
     // the optimization pipeline will (try to) infer the arguments.
@@ -1324,7 +1336,7 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, ScalarEvolution &SE,
     StringRef BenchRes = BenchResBuf.get()->getBuffer();
 
     // Read calibration info
-    bool ReadFailed = [&BenchRes, &ForeachFactor, &UpdateBest]() {
+    bool ReadFailed = [&BenchRes, &Factors, &UpdateBest]() {
       uint64_t CalibTime;
       if (BenchRes.consumeInteger(10, CalibTime))
         return true;
@@ -1336,18 +1348,15 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, ScalarEvolution &SE,
                         << " ns, executed each loop function "
                         << XLVBenchmarkLoopSize * NRuns << " times\n");
 
-      ForeachFactor(
-          [&BenchRes, &UpdateBest](unsigned VF, unsigned IF, unsigned UF) {
-            BenchRes = BenchRes.drop_front(); // drop '\n'
+      for (auto &Fs : Factors) {
+        BenchRes = BenchRes.drop_front(); // drop '\n'
 
-            uint64_t Costs;
-            if (BenchRes.consumeInteger(10, Costs))
-              return true; // break (error)
+        uint64_t Costs;
+        if (BenchRes.consumeInteger(10, Costs))
+          return true;
 
-            UpdateBest(VF, IF, UF, Costs);
-            return false; // continue
-          });
-
+        UpdateBest(std::get<0>(Fs), std::get<1>(Fs), std::get<2>(Fs), Costs);
+      }
       return false;
     }();
     if (ReadFailed) {
