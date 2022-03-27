@@ -51,11 +51,13 @@
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/Program.h"
+#include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/ObjCARC.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include <algorithm>
 #include <ctime>
 #include <random>
+#include <system_error>
 
 using namespace llvm;
 #define DEBUG_TYPE "explorative-lv"
@@ -149,6 +151,10 @@ static cl::opt<bool> XLVDumpModuleIR(
     "xlv-dump-module-ir", cl::Hidden, cl::init(false),
     cl::desc("If true, add a PrintModulePass at the beginning of the "
              "explorative codegen pipeline, printing to stdout"));
+static cl::opt<std::string>
+    XLVCSVOut("xlv-csv-out", cl::Hidden, cl::init(""),
+              cl::desc("Print explorative loop vectorization results as CSV to "
+                       "the given file"));
 
 class ExplorativeLVPass::InputBuilder {
   class MemAccessRange {
@@ -1126,13 +1132,29 @@ struct ExplorativeLVPass::NullCGPipelineContainer {
   }
 };
 
+struct ExplorativeLVPass::CSVOutputContainer {
+  std::error_code EC;
+  raw_fd_ostream OS;
+  std::time_t Timestamp = std::time(nullptr);
+
+  CSVOutputContainer() : OS(XLVCSVOut, EC, sys::fs::OpenFlags::OF_Append) {}
+
+  void print(StringRef Func, unsigned LoopNo, unsigned VF, unsigned IF,
+             unsigned UF, uint64_t Costs) {
+    OS << Timestamp << ',' << Func << ',' << LoopNo << ',' << VF << ',' << IF
+       << ',' << UF << ',' << Costs << '\n';
+  }
+};
+
 ExplorativeLVPass::~ExplorativeLVPass() {
   delete NullCGPipeline;
   delete OptPipeline;
+  delete CSVOutput;
 }
 
 // returns whether an error occured
-bool ExplorativeLVPass::processLoop(Function &F, Loop &L, ScalarEvolution &SE,
+bool ExplorativeLVPass::processLoop(Function &F, Loop &L, unsigned LoopNo,
+                                    ScalarEvolution &SE,
                                     TargetLibraryInfo &TLI) {
   assert(OptPipeline && "OptPipeline not initialized");
 
@@ -1146,8 +1168,12 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, ScalarEvolution &SE,
   unsigned BestUF = 0;
   uint64_t MinCosts = InvalidCosts;
 
-  auto UpdateBest = [&BestVF, &BestIF, &BestUF, &MinCosts](
-                        unsigned VF, unsigned IF, unsigned UF, uint64_t Costs) {
+  auto UpdateBest = [this, Func = F.getName(), LoopNo, &BestVF, &BestIF,
+                     &BestUF, &MinCosts](unsigned VF, unsigned IF, unsigned UF,
+                                         uint64_t Costs) {
+    if (CSVOutput) {
+      CSVOutput->print(Func, LoopNo, VF, IF, UF, Costs);
+    }
     if (Costs == ExplorativeLVPass::InvalidCosts) {
       LLVM_DEBUG(dbgs() << "XLV: costs for VF " << VF << ", IF " << IF
                         << ", UF " << UF << ": (invalid)\n");
@@ -1963,15 +1989,26 @@ PreservedAnalyses ExplorativeLVPass::run(Function &F,
   if (!NullCGPipeline && XLVMetric == Metric::InstCount)
     NullCGPipeline = new NullCGPipelineContainer(*TM, this, TLI);
 
+  if (!CSVOutput && !XLVCSVOut.empty()) {
+    CSVOutput = new CSVOutputContainer();
+    if (CSVOutput->EC) {
+      errs() << "XLV: could not open " << XLVCSVOut << ": "
+             << CSVOutput->EC.message() << '\n';
+      delete CSVOutput;
+      CSVOutput = nullptr;
+    }
+  }
+
   unsigned LoopNo = 0;
   do {
     Loop *L = Worklist.pop_back_val();
-    LLVM_DEBUG(dbgs() << "XLV: --- processing loop " << ++LoopNo << " in "
+    LLVM_DEBUG(dbgs() << "XLV: --- processing loop " << LoopNo << " in "
                       << F.getName() << " ---\n");
-    if (processLoop(F, *L, SE, TLI)) {
+    if (processLoop(F, *L, LoopNo, SE, TLI)) {
       LLVM_DEBUG(dbgs() << "XLV: processing loop failed, letting the "
                            "AutoVectorizer determine VF and IF\n");
     }
+    ++LoopNo;
   } while (!Worklist.empty());
 
   return PreservedAnalyses::all();

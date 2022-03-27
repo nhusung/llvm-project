@@ -57,7 +57,7 @@ private:
   // the pipeline every time, since we cannot simply replace the output stream.
   NullCGPipelineContainer *NullCGPipeline = nullptr;
 
-  bool processLoop(Function &F, Loop &L, ScalarEvolution &SE,
+  bool processLoop(Function &F, Loop &L, unsigned LoopNo, ScalarEvolution &SE,
                    TargetLibraryInfo &TLI);
 
   // For benchmarking mode: It is easier to infer the inputs in the "children"
@@ -77,6 +77,9 @@ private:
     return It == EvaluationInfoMap->end() ? nullptr : &It->getSecond();
   }
 
+  struct CSVOutputContainer;
+  CSVOutputContainer *CSVOutput = nullptr;
+
 public:
   ExplorativeLVPass(TargetMachine *TM, PipelineTuningOptions PTO,
                     Optional<PGOOptions> PGOOpt)
@@ -84,12 +87,14 @@ public:
 
   ExplorativeLVPass(ExplorativeLVPass &&Pass)
       : TM(Pass.TM), PTO(std::move(Pass.PTO)), PGOOpt(std::move(Pass.PGOOpt)),
-        OptPipeline(Pass.OptPipeline), NullCGPipeline(Pass.NullCGPipeline) {
+        OptPipeline(Pass.OptPipeline), NullCGPipeline(Pass.NullCGPipeline),
+        CSVOutput(Pass.CSVOutput) {
     assert(!EvaluationInfoMap && "EvaluationInfoMap present during move");
     assert(!InferredInputs && "InferredInputs present during move");
 
     Pass.OptPipeline = nullptr;
     Pass.NullCGPipeline = nullptr;
+    Pass.CSVOutput = nullptr;
   }
 
   ExplorativeLVPass(const ExplorativeLVPass &Pass) = delete;
