@@ -40,6 +40,7 @@
 #include "llvm/IR/Instruction.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/LegacyPassManager.h"
+#include "llvm/IR/Metadata.h"
 #include "llvm/IR/Value.h"
 #include "llvm/Passes/StandardInstrumentations.h"
 #include "llvm/Support/Casting.h"
@@ -270,7 +271,7 @@ namespace {
 
 class LoopModuleBuilder : public ValueMaterializer {
   const Function &OrigFunc;
-  Loop &L;
+  const Loop &L;
   ScalarEvolution &SE;
 
   Module *M = nullptr;
@@ -517,16 +518,6 @@ Module *LoopModuleBuilder::getModule() {
 // but also from IPO/LoopExtractor.cpp resp. Utils/CodeExtractor.cpp
 Function *LoopModuleBuilder::buildLoopFunc(unsigned VF, unsigned IF,
                                            unsigned UF) {
-  // Note that we actually modify the original loop here.  According to the docs
-  // the metadata is attached to the branch instructions in the latches, so it
-  // might be a bit difficult to directly add the metadata to the new
-  // function.  Hence, we do it here.  Since we finally choose the values
-  // explicitly for the original loop, it does not matter much anyway.
-  llvm::addStringMetadataToLoop(&L, "llvm.loop.vectorize.width", VF);
-  llvm::addStringMetadataToLoop(&L, "llvm.loop.interleave.count", IF);
-  if (UF)
-    llvm::addStringMetadataToLoop(&L, "llvm.loop.unroll.count", UF);
-
   Function *LoopFunc = Function::Create(
       FuncTy, GlobalValue::ExternalLinkage, OrigFunc.getAddressSpace(),
       OrigFunc.getName() + "." + Twine(VF) + "." + Twine(IF) + Twine(".") +
@@ -709,12 +700,32 @@ Function *LoopModuleBuilder::buildLoopFunc(unsigned VF, unsigned IF,
     LoopFunc->addMetadata(MD.first, *Mapper.mapMDNode(*MD.second));
   }
 
+  // Replace loop metadata
+  SmallVector<Metadata *, 4> LoopMDs(1); // first is the MDNode's ID
+  Type *I32Ty = Type::getInt32Ty(C);
+  LoopMDs.push_back(
+      MDNode::get(C, {MDString::get(C, "llvm.loop.vectorize.width"),
+                      ConstantAsMetadata::get(ConstantInt::get(I32Ty, VF))}));
+  LoopMDs.push_back(
+      MDNode::get(C, {MDString::get(C, "llvm.loop.interleave.count"),
+                      ConstantAsMetadata::get(ConstantInt::get(I32Ty, IF))}));
+  if (UF) {
+    LoopMDs.push_back(
+        MDNode::get(C, {MDString::get(C, "llvm.loop.unroll.count"),
+                        ConstantAsMetadata::get(ConstantInt::get(I32Ty, UF))}));
+  }
+  MDNode *LoopMD = MDNode::get(C, LoopMDs);
+  LoopMD->replaceOperandWith(0, LoopMD); // set the MDNode's ID
+  BasicBlock *Latch = cast<BasicBlock>(VMap[L.getLoopLatch()]);
+  Latch->getTerminator()->setMetadata(LLVMContext::MD_loop, LoopMD);
+  VMap.MD().try_emplace(LoopMD, LoopMD);
+
   // Loop over all of the instructions in the new function, fixing up operand
   // references as we go. This uses VMap to do all the hard work.
   for (BasicBlock &BB : *LoopFunc) {
     // Loop over all instructions, fixing each one as we find it...
-    for (Instruction &II : BB)
-      Mapper.remapInstruction(II);
+    for (Instruction &I : BB)
+      Mapper.remapInstruction(I);
   }
 
   // Restore MDMap
@@ -1951,10 +1962,6 @@ PreservedAnalyses ExplorativeLVPass::run(Function &F,
     if (processLoop(F, *L, SE, TLI)) {
       LLVM_DEBUG(dbgs() << "XLV: processing loop failed, letting the "
                            "AutoVectorizer determine VF and IF\n");
-      addStringMetadataToLoop(L, "llvm.loop.vectorize.width", 0);
-      addStringMetadataToLoop(L, "llvm.loop.interleave.count", 0);
-      if (XLVMaxUF)
-        addStringMetadataToLoop(L, "llvm.loop.unroll.count", 0);
     }
   } while (!Worklist.empty());
 
