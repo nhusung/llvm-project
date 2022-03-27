@@ -126,6 +126,9 @@ static cl::opt<unsigned>
     XLVBenchmarkLoopSize("xlv-benchmark-loop-size", cl::Hidden, cl::init(32),
                          cl::desc("In benchmarking mode: size (loop "
                                   "function calls) of the benchmark loop"));
+static cl::opt<bool>
+    XLVBenchmarkKeepExec("xlv-benchmark-keep-exec", cl::Hidden, cl::init(false),
+                         cl::desc("In benchmarking mode: keep the executable"));
 
 static cl::opt<bool>
     XLVDivVF("xlv-divide-by-vf", cl::Hidden, cl::init(false),
@@ -258,7 +261,7 @@ void InputBuilder::build(Module &M, ArrayRef<Type *> Params,
       ArgVal = Constant::getNullValue(Params[I]);
     }
 
-    LLVM_DEBUG(dbgs() << "XLV: arg " << *ArgVal << "\n");
+    LLVM_DEBUG(dbgs() << "XLV: arg " << *ArgVal << '\n');
     Args.push_back(ArgVal);
   }
 }
@@ -336,7 +339,7 @@ bool LoopModuleBuilder::determineIO() {
         if (!isa<IntrinsicInst>(I)) {
           LLVM_DEBUG(dbgs()
                      << "XLV: loop contains a non-intrinsic call instruction: "
-                     << I << "\n");
+                     << I << '\n');
           return false;
         }
 
@@ -718,7 +721,7 @@ Function *LoopModuleBuilder::buildLoopFunc(unsigned VF, unsigned IF,
   VMap.MD().swap(MDModuleMap);
 
   if (VF == 1 && IF == 1 && XLVDumpFuncIR)
-    dbgs() << *LoopFunc << "\n";
+    dbgs() << *LoopFunc << '\n';
 
   LoopFuncs.push_back(LoopFunc);
   return LoopFunc;
@@ -1297,7 +1300,7 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, ScalarEvolution &SE,
       return true;
     }
     if (RetCode == -1) {
-      errs() << "XLV: failed to execute " << ExecPath << "\n";
+      errs() << "XLV: failed to execute " << ExecPath << '\n';
       ExecRemover.releaseFile();
       return true;
     }
@@ -1339,9 +1342,14 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, ScalarEvolution &SE,
     if (ReadFailed) {
       errs() << "XLV: could not read integer from benchmarking results.  You "
                 "can find the binary at "
-             << ExecPath << "\n";
+             << ExecPath << '\n';
       ExecRemover.releaseFile();
       return true;
+    }
+    if (XLVBenchmarkKeepExec) {
+      dbgs() << "XLV: keeping the benchmarking executable at " << ExecPath
+             << '\n';
+      ExecRemover.releaseFile();
     }
   }
 
@@ -1845,7 +1853,7 @@ static void inferInputs(const Function &F, Loop &L, ScalarEvolution &SE,
   // Obtain/choose a trip count
   const SCEV *MaxBackedgeTakenCount = SE.getSymbolicMaxBackedgeTakenCount(&L);
   LLVM_DEBUG(dbgs() << "XLV: backedge taken count is " << *MaxBackedgeTakenCount
-                    << "\n");
+                    << '\n');
   Optional<APInt> BTRes = SCEVBackedgeTakenAnalyzer::analyze(
       SE, MaxBackedgeTakenCount, InferredInputs, XLVDesiredTripCount - 1);
   if (!BTRes) {
@@ -1876,7 +1884,7 @@ static void inferInputs(const Function &F, Loop &L, ScalarEvolution &SE,
       }
 
       const SCEV *LocSCEV = SE.getSCEV(const_cast<Value *>(Loc));
-      LLVM_DEBUG(dbgs() << "XLV: memory access at " << *LocSCEV << "\n");
+      LLVM_DEBUG(dbgs() << "XLV: memory access at " << *LocSCEV << '\n');
       MAAnalyzer.analyze(LocSCEV);
     }
   }
@@ -1893,7 +1901,7 @@ PreservedAnalyses ExplorativeLVPass::run(Function &F,
       auto LoopIt = LI.begin();
       if (LoopIt + 1 != LI.end()) {
         LLVM_DEBUG(dbgs() << "XLV: expected exactly one loop in loop function "
-                          << F.getName() << "\n");
+                          << F.getName() << '\n');
         return PreservedAnalyses::all();
       }
       inferInputs(F, **LoopIt, SE, *MainPass->InferredInputs);
