@@ -113,7 +113,7 @@ static cl::opt<uint64_t> XLVBenchmarkUSecs(
 static cl::opt<XLVClockid> XLVBenchmarkClockid(
     "xlv-benchmark-clock", cl::Hidden,
     cl::desc("In benchmarking mode: clock to use, see clock_gettime(3)"),
-    cl::init(XLVClockid::MONOTONIC),
+    cl::init(XLVClockid::PROCESS_CPUTIME_ID),
     cl::values(clEnumValN(XLVClockid::MONOTONIC, "monotonic",
                           "CLOCK_MONOTONIC"),
                clEnumValN(XLVClockid::PROCESS_CPUTIME_ID, "process",
