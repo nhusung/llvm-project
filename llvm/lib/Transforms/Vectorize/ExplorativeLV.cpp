@@ -1179,8 +1179,8 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, unsigned LoopNo,
       // - VF
       // - IF
       // - UF
-      // - costs ("-" if invalid)
-      // - reference (number of runs if in benchmarking mode, "-" else)
+      // - costs (empty if invalid)
+      // - reference (number of runs if in benchmarking mode, else empty)
       CSVOutput->OS << CSVOutput->Timestamp << ',';
       switch (XLVMetric) {
       case Metric::Disable:
@@ -1197,10 +1197,11 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, unsigned LoopNo,
       }
       CSVOutput->OS << Func << ',' << LoopNo << ',' << VF << ',' << IF << ','
                     << UF << ',';
-      Costs == InvalidCosts ? CSVOutput->OS << '-' : CSVOutput->OS << Costs;
+      if (Costs != InvalidCosts)
+        CSVOutput->OS << Costs;
       CSVOutput->OS << ',';
-      Reference == InvalidCosts ? CSVOutput->OS << '-'
-                                : CSVOutput->OS << Reference;
+      if (Reference != InvalidCosts)
+        CSVOutput->OS << Reference;
       CSVOutput->OS << '\n';
     }
 
