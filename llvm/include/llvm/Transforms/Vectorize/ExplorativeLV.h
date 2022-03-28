@@ -41,6 +41,13 @@ public:
   friend struct MachineCodeExplorer;
   static const uint64_t InvalidCosts = UINT64_MAX;
 
+  struct EvaluationInfo {
+    unsigned VF, IF, UF;
+    uint64_t Costs = InvalidCosts;
+    EvaluationInfo(unsigned VF, unsigned IF, unsigned UF)
+        : VF(VF), IF(IF), UF(UF) {}
+  };
+
 private:
   struct OptPipelineContainer;
   struct NullCGPipelineContainer;
@@ -64,12 +71,6 @@ private:
   // pipelines.  This is used to pass them back to the "parent" pipeline.
   InputBuilder *InferredInputs = nullptr;
 
-  struct EvaluationInfo {
-    unsigned VF;
-    unsigned IF;
-    unsigned UF;
-    uint64_t Costs;
-  };
   DenseMap<Function *, EvaluationInfo> *EvaluationInfoMap = nullptr;
   EvaluationInfo *getEvalutaionInfo(const Function &F) {
     assert(EvaluationInfoMap && "No EvaluationInfoMap present");

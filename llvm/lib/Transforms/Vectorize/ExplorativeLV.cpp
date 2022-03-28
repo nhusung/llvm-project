@@ -25,6 +25,7 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/CFG.h"
 #include "llvm/Analysis/ExplorativeLV.h"
+#include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/LoopIterator.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
@@ -54,6 +55,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/ObjCARC.h"
 #include "llvm/Transforms/Utils/Cloning.h"
+#include "llvm/Transforms/Utils/LoopUtils.h"
 #include <algorithm>
 #include <ctime>
 #include <random>
@@ -292,7 +294,7 @@ class LoopModuleBuilder : public ValueMaterializer {
   SmallVector<const Instruction *> Outputs;
   FunctionType *FuncTy;
   Function *RefLoopFunc = nullptr;
-  SmallVector<Function *> LoopFuncs;
+  DenseMap<Function *, ExplorativeLVPass::EvaluationInfo> LoopFuncs;
 
   InputBuilder InferredInputs;
   unsigned FullUnroll = 0;
@@ -317,10 +319,12 @@ public:
 
   Function *buildLoopFunc(unsigned VF, unsigned IF, unsigned UF);
   unsigned getNumLoopFuncs() { return LoopFuncs.size(); }
+  DenseMap<Function *, ExplorativeLVPass::EvaluationInfo> *getLoopFuncs() {
+    return &LoopFuncs;
+  }
   void clearLoopFuncs() {
-    for (Function *LoopFunc : LoopFuncs) {
-      LoopFunc->eraseFromParent();
-    }
+    for (auto &KV : LoopFuncs)
+      KV.first->eraseFromParent();
     LoopFuncs.clear();
   }
 
@@ -532,8 +536,7 @@ Function *LoopModuleBuilder::buildLoopFunc(unsigned VF, unsigned IF,
                                            unsigned UF) {
   Function *LoopFunc = Function::Create(
       FuncTy, GlobalValue::ExternalLinkage, OrigFunc.getAddressSpace(),
-      OrigFunc.getName() + "." + Twine(VF) + "." + Twine(IF) + Twine(".") +
-          Twine(UF),
+      OrigFunc.getName() + "." + Twine(VF) + "." + Twine(IF) + "." + Twine(UF),
       M);
 
   LLVMContext &C = LoopFunc->getContext();
@@ -712,26 +715,6 @@ Function *LoopModuleBuilder::buildLoopFunc(unsigned VF, unsigned IF,
     LoopFunc->addMetadata(MD.first, *Mapper.mapMDNode(*MD.second));
   }
 
-  // Replace loop metadata
-  SmallVector<Metadata *, 4> LoopMDs(1); // first is the MDNode's ID
-  Type *I32Ty = Type::getInt32Ty(C);
-  LoopMDs.push_back(
-      MDNode::get(C, {MDString::get(C, "llvm.loop.vectorize.width"),
-                      ConstantAsMetadata::get(ConstantInt::get(I32Ty, VF))}));
-  LoopMDs.push_back(
-      MDNode::get(C, {MDString::get(C, "llvm.loop.interleave.count"),
-                      ConstantAsMetadata::get(ConstantInt::get(I32Ty, IF))}));
-  if (UF) {
-    LoopMDs.push_back(
-        MDNode::get(C, {MDString::get(C, "llvm.loop.unroll.count"),
-                        ConstantAsMetadata::get(ConstantInt::get(I32Ty, UF))}));
-  }
-  MDNode *LoopMD = MDNode::get(C, LoopMDs);
-  LoopMD->replaceOperandWith(0, LoopMD); // set the MDNode's ID
-  BasicBlock *Latch = cast<BasicBlock>(VMap[L.getLoopLatch()]);
-  Latch->getTerminator()->setMetadata(LLVMContext::MD_loop, LoopMD);
-  VMap.MD().try_emplace(LoopMD, LoopMD);
-
   // Loop over all of the instructions in the new function, fixing up operand
   // references as we go. This uses VMap to do all the hard work.
   for (BasicBlock &BB : *LoopFunc) {
@@ -743,12 +726,18 @@ Function *LoopModuleBuilder::buildLoopFunc(unsigned VF, unsigned IF,
   // Restore MDMap
   VMap.MD().swap(MDModuleMap);
 
-  if (VF == 1 && IF == 1 && XLVDumpFuncIR)
-    dbgs() << *LoopFunc << '\n';
-
-  LoopFuncs.push_back(LoopFunc);
-  if (VF == 1 && IF == 1 && UF <= 1)
+  LoopFuncs.try_emplace(LoopFunc, VF, IF, UF);
+  if (VF == 1 && IF == 1 && UF <= 1) {
     RefLoopFunc = LoopFunc;
+
+    if (XLVDumpFuncIR)
+      dbgs() << *LoopFunc << '\n';
+  }
+
+  // Note: We did not set the desired VF/IF/UF here.  This will happen in the
+  // "child" pass (ExplorativeLVPass::run()) since otherwise, the unrolling
+  // might be performed before loop vectorization.
+
   return LoopFunc;
 }
 
@@ -793,14 +782,16 @@ void LoopModuleBuilder::buildMainFuncBody() {
                        OrigFunc.getAddressSpace(), "printf", M);
 
   // We build a benchmarking function that takes a loop function and an integer
-  // n as argument and the function n * ExploreBenchmarkLoopSize times.  This
-  // function itself is called by `int main(void)`.
-  // To infer a suitable n, we build a calibration function that counts the
-  // repitions needed until the elapsed time exceeds some threshold.
-  FunctionType *BenchFuncTy =
-      FunctionType::get(Type::getVoidTy(C), {LoopFuncPtrTy, IntTy}, false);
+  // n as argument and calls the loop function n * ExploreBenchmarkLoopSize
+  // times.  The function furthermore takes the VF, IF and UF, which are just
+  // printed along with the time.  The benchmarking function itself is called by
+  // `int main(void)`.
+  FunctionType *BenchFuncTy = FunctionType::get(
+      Type::getVoidTy(C), {LoopFuncPtrTy, IntTy, IntTy, IntTy, IntTy}, false);
   Function *BenchFunc =
       Function::Create(BenchFuncTy, GlobalValue::PrivateLinkage, "bench", M);
+  // To infer a suitable n, we build a calibration function that counts the
+  // repitions needed until the elapsed time exceeds some threshold.
   FunctionType *CalibFuncTy = FunctionType::get(IntTy, {LoopFuncPtrTy}, false);
   Function *CalibFunc =
       Function::Create(CalibFuncTy, GlobalValue::PrivateLinkage, "calib", M);
@@ -809,6 +800,12 @@ void LoopModuleBuilder::buildMainFuncBody() {
   FuncArg->setName("func");
   Argument *NArg = BenchFunc->getArg(1);
   NArg->setName("n");
+  Argument *VFArg = BenchFunc->getArg(2);
+  VFArg->setName("vf");
+  Argument *IFArg = BenchFunc->getArg(3);
+  IFArg->setName("if");
+  Argument *UFArg = BenchFunc->getArg(4);
+  UFArg->setName("uf");
   Argument *CFuncArg = CalibFunc->getArg(0);
   CFuncArg->setName("func");
 
@@ -927,7 +924,7 @@ void LoopModuleBuilder::buildMainFuncBody() {
   Value *TDiff = TimeDiff(TStartVar, TEndVar, EvalBB);
 
   // Create format strings
-  Constant *FormatStr = ConstantDataArray::getString(C, "%llu\n");
+  Constant *FormatStr = ConstantDataArray::getString(C, "%u %u %u %llu\n");
   Constant *CFormatStr = ConstantDataArray::getString(C, "%llu %u\n");
   GlobalVariable *FormatStrGV =
       new GlobalVariable(*M, FormatStr->getType(), true,
@@ -942,8 +939,9 @@ void LoopModuleBuilder::buildMainFuncBody() {
       CFormatStrGV->getValueType(), CFormatStrGV,
       ArrayRef<Constant *>{I640, I640});
 
-  // `printf(fstr, dt); return;` / `printf(fstr, dt, n); return;`
-  CallInst::Create(PrintfFuncTy, PrintfFunc, {FormatStrPtr, TDiff}, "", EvalBB);
+  // `printf(fstr, vf, if, uf, dt); return;` / `printf(fstr, dt, n); return;`
+  CallInst::Create(PrintfFuncTy, PrintfFunc,
+                   {FormatStrPtr, VFArg, IFArg, UFArg, TDiff}, "", EvalBB);
   ReturnInst::Create(C, EvalBB);
 
   CallInst::Create(PrintfFuncTy, PrintfFunc, {CFormatStrPtr, CTDiff, CCountPhi},
@@ -957,8 +955,13 @@ void LoopModuleBuilder::buildMainFuncBody() {
   BasicBlock *MainBB = BasicBlock::Create(C, "main", MainFunc);
   CallInst *NRuns =
       CallInst::Create(CalibFuncTy, CalibFunc, {RefLoopFunc}, "n", MainBB);
-  for (Function *LoopFunc : LoopFuncs)
-    CallInst::Create(BenchFuncTy, BenchFunc, {LoopFunc, NRuns}, "", MainBB);
+  for (auto &KV : LoopFuncs) {
+    Constant *VF = ConstantInt::get(IntTy, KV.second.VF);
+    Constant *IF = ConstantInt::get(IntTy, KV.second.IF);
+    Constant *UF = ConstantInt::get(IntTy, KV.second.UF);
+    CallInst::Create(BenchFuncTy, BenchFunc, {KV.first, NRuns, VF, IF, UF}, "",
+                     MainBB);
+  }
 
   ReturnInst::Create(C, Int0, MainBB);
 }
@@ -1136,14 +1139,7 @@ struct ExplorativeLVPass::CSVOutputContainer {
   std::error_code EC;
   raw_fd_ostream OS;
   std::time_t Timestamp = std::time(nullptr);
-
   CSVOutputContainer() : OS(XLVCSVOut, EC, sys::fs::OpenFlags::OF_Append) {}
-
-  void print(StringRef Func, unsigned LoopNo, unsigned VF, unsigned IF,
-             unsigned UF, uint64_t Costs) {
-    OS << Timestamp << ',' << Func << ',' << LoopNo << ',' << VF << ',' << IF
-       << ',' << UF << ',' << Costs << '\n';
-  }
 };
 
 ExplorativeLVPass::~ExplorativeLVPass() {
@@ -1163,6 +1159,8 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, unsigned LoopNo,
   if (!M)
     return true;
 
+  EvaluationInfoMap = Builder.getLoopFuncs();
+
   unsigned BestVF = 1;
   unsigned BestIF = 1;
   unsigned BestUF = 0;
@@ -1170,16 +1168,53 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, unsigned LoopNo,
 
   auto UpdateBest = [this, Func = F.getName(), LoopNo, &BestVF, &BestIF,
                      &BestUF, &MinCosts](unsigned VF, unsigned IF, unsigned UF,
-                                         uint64_t Costs) {
+                                         uint64_t Costs,
+                                         uint64_t Reference = InvalidCosts) {
     if (CSVOutput) {
-      CSVOutput->print(Func, LoopNo, VF, IF, UF, Costs);
+      // We use the following columns:
+      // - timestamp (secs since unix epoch)
+      // - metric ("inst-count"/"mca"/"benchmark")
+      // - function name
+      // - loop number
+      // - VF
+      // - IF
+      // - UF
+      // - costs ("-" if invalid)
+      // - reference (number of runs if in benchmarking mode, "-" else)
+      CSVOutput->OS << CSVOutput->Timestamp << ',';
+      switch (XLVMetric) {
+      case Metric::Disable:
+        llvm_unreachable("XLVMetric is Disable in evaluation");
+      case Metric::InstCount:
+        CSVOutput->OS << "inst-count,";
+        break;
+      case Metric::MCA:
+        CSVOutput->OS << "mca,";
+        break;
+      case Metric::Benchmark:
+        CSVOutput->OS << "benchmark,";
+        break;
+      }
+      CSVOutput->OS << Func << ',' << LoopNo << ',' << VF << ',' << IF << ','
+                    << UF << ',';
+      Costs == InvalidCosts ? CSVOutput->OS << '-' : CSVOutput->OS << Costs;
+      CSVOutput->OS << ',';
+      Reference == InvalidCosts ? CSVOutput->OS << '-'
+                                : CSVOutput->OS << Reference;
+      CSVOutput->OS << '\n';
     }
-    if (Costs == ExplorativeLVPass::InvalidCosts) {
+
+    if (Costs == InvalidCosts) {
       LLVM_DEBUG(dbgs() << "XLV: costs for VF " << VF << ", IF " << IF
                         << ", UF " << UF << ": (invalid)\n");
       return;
     }
 
+    // FIXME: We should remove this switch.  For the InstCount and MCA metric,
+    // we need to take into account how much work is done by the given
+    // instructions.  This is probably more complex than just dividing by the
+    // VF.  We should also multiply the costs first to avoid loss of precision.
+    // In benchmarking mode this switch does not make sense at all.
     if (XLVDivVF)
       Costs /= VF;
 
@@ -1218,29 +1253,22 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, unsigned LoopNo,
   };
 
   if (XLVMetric == Metric::InstCount) {
-    DenseMap<Function *, EvaluationInfo> ResultMap;
-    EvaluationInfoMap = &ResultMap;
-
     // Build a module containing functions for all VF/IF combinations.  We only
     // consider UF 1, everything else is not interesting when counting
     // instructions.
     for (unsigned VF = 1; VF <= XLVMaxVF; VF *= 2) {
-      for (unsigned IF = 1; IF <= XLVMaxIF; IF *= 2) {
-        Function *Func = Builder.buildLoopFunc(VF, IF, 1);
-        ResultMap[Func] = {VF, IF, 1, InvalidCosts};
-      }
+      for (unsigned IF = 1; IF <= XLVMaxIF; IF *= 2)
+        Builder.buildLoopFunc(VF, IF, 1);
     }
 
     // Run pipelines
     OptPipeline->run(*M);
     NullCGPipeline->PM.run(*M);
 
-    for (auto &KV : ResultMap) {
+    for (auto &KV : *EvaluationInfoMap) {
       EvaluationInfo &Info = KV.second;
       UpdateBest(Info.VF, Info.IF, Info.UF, Info.Costs);
     }
-
-    EvaluationInfoMap = nullptr;
   } else if (XLVMetric == Metric::MCA) {
     ForeachFactor([this, &Builder, M, TLI,
                    &UpdateBest](unsigned VF, unsigned IF, unsigned UF) {
@@ -1264,31 +1292,30 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, unsigned LoopNo,
       // sure the assembly printer has finished
       uint64_t Costs =
           performMCACostCalc(ASMPath, TM->getTargetCPU(), M->getTargetTriple());
-      UpdateBest(VF, IF, 0, Costs);
+      UpdateBest(VF, IF, UF, Costs);
 
       Builder.clearLoopFuncs();
-
-      return false; // continue;
     });
   } else {
     assert(XLVMetric == Metric::Benchmark);
 
-    // Build a module containing functions for all VF/IF/UF combinations
-    SmallVector<std::tuple<unsigned, unsigned, unsigned>> Factors;
-    ForeachFactor([&Factors](unsigned VF, unsigned IF, unsigned UF) {
-      Factors.emplace_back(VF, IF, UF);
-    });
-    if (XLVBenchmarkRandOrder) {
-      std::random_device RD;
-      std::default_random_engine RNG(RD());
-      std::shuffle(Factors.begin(), Factors.end(), RNG);
+    /* Build a module containing functions for all VF/IF/UF combinations */ {
+      SmallVector<std::tuple<unsigned, unsigned, unsigned>> Factors;
+      ForeachFactor([&Factors](unsigned VF, unsigned IF, unsigned UF) {
+        Factors.emplace_back(VF, IF, UF);
+      });
+      if (XLVBenchmarkRandOrder) {
+        std::random_device RD;
+        std::default_random_engine RNG(RD());
+        std::shuffle(Factors.begin(), Factors.end(), RNG);
+      }
+      for (auto &Fs : Factors)
+        Builder.buildLoopFunc(std::get<0>(Fs), std::get<1>(Fs),
+                              std::get<2>(Fs));
     }
 
-    for (auto &Fs : Factors)
-      Builder.buildLoopFunc(std::get<0>(Fs), std::get<1>(Fs), std::get<2>(Fs));
-
-    // Get a reference to the inferred inputs vector.  The ExplorativeLVPass in
-    // the optimization pipeline will (try to) infer the arguments.
+    // Get a reference to the InputBuilder.  The ExplorativeLVPass in the
+    // optimization pipeline will (try to) infer the arguments.
     InferredInputs = &Builder.getInferredInputsRef();
 
     OptPipeline->run(*M);
@@ -1328,11 +1355,16 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, unsigned LoopNo,
       ObjectRemover.releaseFile();
       return true;
     }
+    if (XLVBenchmarkKeepExec) {
+      dbgs() << "XLV: keeping the benchmarking executable at " << ExecPath
+             << '\n';
+      ExecRemover.releaseFile();
+    }
 
     // Do the benchmarking
     // Timout: ceil(2 * (calib_secs + n * bench_secs)))
-    unsigned TimeoutS =
-        1 + 2 * (Builder.getNumLoopFuncs() + 1) * XLVBenchmarkUSecs / 1000000;
+    unsigned FuncCount = Builder.getNumLoopFuncs();
+    unsigned TimeoutS = 1 + 2 * (FuncCount + 1) * XLVBenchmarkUSecs / 1000000;
     LLVM_DEBUG(dbgs() << "XLV: benchmarking for up to " << TimeoutS
                       << " s ...\n");
     SmallString<32> BenchResPath;
@@ -1342,10 +1374,7 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, unsigned LoopNo,
         ExecPath, {"explorative-lv"}, None,
         {StringRef(""), BenchResPath.str(), StringRef("")}, TimeoutS);
     if (RetCode == -2) {
-      errs()
-          << "XLV: benchmarking failed/timed out.  You can find the binary at "
-          << ExecPath << '\n';
-      ExecRemover.releaseFile();
+      errs() << "XLV: benchmarking failed/timed out\n";
       return true;
     }
     if (RetCode == -1) {
@@ -1362,40 +1391,31 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, unsigned LoopNo,
     StringRef BenchRes = BenchResBuf.get()->getBuffer();
 
     // Read calibration info
-    bool ReadFailed = [&BenchRes, &Factors, &UpdateBest]() {
-      uint64_t CalibTime;
-      if (BenchRes.consumeInteger(10, CalibTime))
-        return true;
-      BenchRes = BenchRes.drop_front(); // drop ' '
-      unsigned NRuns;
-      if (BenchRes.consumeInteger(10, NRuns))
-        return true;
-      LLVM_DEBUG(dbgs() << "XLV: calibration run took " << CalibTime
-                        << " ns, executed each loop function "
-                        << XLVBenchmarkLoopSize * NRuns << " times\n");
-
-      for (auto &Fs : Factors) {
-        BenchRes = BenchRes.drop_front(); // drop '\n'
-
-        uint64_t Costs;
-        if (BenchRes.consumeInteger(10, Costs))
-          return true;
-
-        UpdateBest(std::get<0>(Fs), std::get<1>(Fs), std::get<2>(Fs), Costs);
-      }
-      return false;
-    }();
-    if (ReadFailed) {
-      errs() << "XLV: could not read integer from benchmarking results.  You "
-                "can find the binary at "
-             << ExecPath << '\n';
-      ExecRemover.releaseFile();
+    uint64_t CalibTime;
+    unsigned NRuns;
+    if (BenchRes.consumeInteger(10, CalibTime) ||
+        !BenchRes.consume_front(" ") || BenchRes.consumeInteger(10, NRuns)) {
+      errs() << "XLV: malformed benchmarking results\n";
       return true;
     }
-    if (XLVBenchmarkKeepExec) {
-      dbgs() << "XLV: keeping the benchmarking executable at " << ExecPath
-             << '\n';
-      ExecRemover.releaseFile();
+    LLVM_DEBUG(dbgs() << "XLV: calibration run took " << CalibTime
+                      << " ns, executed each loop function "
+                      << XLVBenchmarkLoopSize * NRuns << " times\n");
+
+    for (unsigned I = 0; I < FuncCount; ++I) {
+      BenchRes = BenchRes.drop_front(); // drop '\n'
+
+      unsigned VF, IF, UF;
+      uint64_t Costs;
+      if (BenchRes.consumeInteger(10, VF) || !BenchRes.consume_front(" ") ||
+          BenchRes.consumeInteger(10, IF) || !BenchRes.consume_front(" ") ||
+          BenchRes.consumeInteger(10, UF) || !BenchRes.consume_front(" ") ||
+          BenchRes.consumeInteger(10, Costs)) {
+        errs() << "XLV: malformed benchmarking results\n";
+        return true;
+      }
+
+      UpdateBest(VF, IF, UF, Costs, NRuns);
     }
   }
 
@@ -1405,7 +1425,7 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, unsigned LoopNo,
                     << ", UF " << BestUF << '\n');
   addStringMetadataToLoop(&L, "llvm.loop.vectorize.width", BestVF);
   addStringMetadataToLoop(&L, "llvm.loop.interleave.count", BestIF);
-  if (BestUF != 0)
+  if (BestUF)
     addStringMetadataToLoop(&L, "llvm.loop.unroll.count", BestUF);
 
   return false; // no errors
@@ -1943,19 +1963,33 @@ PreservedAnalyses ExplorativeLVPass::run(Function &F,
   auto &SE = AM.getResult<ScalarEvolutionAnalysis>(F);
 
   if (MainPass) { // "child" pass
+    assert(MainPass->EvaluationInfoMap);
+    EvaluationInfo *Factors = MainPass->getEvalutaionInfo(F);
+
+    // Find loop
+    auto LoopIt = LI.begin();
+    if (LoopIt + 1 != LI.end()) {
+      LLVM_DEBUG(dbgs() << "XLV: expected exactly one loop in loop function "
+                        << F.getName() << '\n');
+      return PreservedAnalyses::all();
+    }
+    Loop *L = *LoopIt;
+
+    // Add VF/IF/UF
+    addStringMetadataToLoop(L, "llvm.loop.vectorize.width", Factors->VF);
+    addStringMetadataToLoop(L, "llvm.loop.interleave.count", Factors->IF);
+    if (Factors->UF)
+      addStringMetadataToLoop(L, "llvm.loop.unroll.count", Factors->UF);
+
+    // Infer inputs (if desired, i. e. MainPass->InferredInputs is present)
     if (MainPass->InferredInputs) {
-      auto LoopIt = LI.begin();
-      if (LoopIt + 1 != LI.end()) {
-        LLVM_DEBUG(dbgs() << "XLV: expected exactly one loop in loop function "
-                          << F.getName() << '\n');
-        return PreservedAnalyses::all();
-      }
-      inferInputs(F, **LoopIt, SE, *MainPass->InferredInputs);
+      inferInputs(F, *L, SE, *MainPass->InferredInputs);
 
       // The inputs should be inferred once only and not for every VF-IF
       // combination.
       MainPass->InferredInputs = nullptr;
     }
+
     return PreservedAnalyses::all();
   }
 
@@ -2010,6 +2044,8 @@ PreservedAnalyses ExplorativeLVPass::run(Function &F,
     }
     ++LoopNo;
   } while (!Worklist.empty());
+
+  EvaluationInfoMap = nullptr; // clean up
 
   return PreservedAnalyses::all();
 }
