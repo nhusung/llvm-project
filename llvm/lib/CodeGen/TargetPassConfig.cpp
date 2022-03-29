@@ -220,7 +220,19 @@ static cl::opt<CFLAAType> UseCFLAA(
 
 namespace llvm {
 // Whether to enable the MachineCodeExplorer for explorative vectorization
-extern cl::opt<ExplorativeLVPass::Metric> XLVMetric;
+cl::opt<ExplorativeLVPass::Metric> XLVMetric(
+    "xlv-metric", cl::Hidden,
+    cl::desc(
+        "Which metric to use for machine code evaluation in loop exploration"),
+    cl::init(ExplorativeLVPass::Metric::Disable),
+    cl::values(clEnumValN(ExplorativeLVPass::Metric::Disable, "disable",
+                          "Disable explorative loop vectorization"),
+               clEnumValN(ExplorativeLVPass::Metric::InstCount, "inst-count",
+                          "Count instructions"),
+               clEnumValN(ExplorativeLVPass::Metric::MCA, "mca",
+                          "Use llvm-mca"),
+               clEnumValN(ExplorativeLVPass::Metric::Benchmark, "benchmark",
+                          "Benchmark")));
 } // namespace llvm
 
 /// Option names for limiting the codegen pipeline.

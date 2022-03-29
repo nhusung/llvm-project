@@ -66,24 +66,8 @@ using namespace llvm;
 
 namespace llvm {
 
-cl::opt<ExplorativeLVPass::Metric> XLVMetric(
-    "xlv-metric", cl::Hidden,
-    cl::desc(
-        "Which metric to use for machine code evaluation in loop exploration"),
-    cl::init(ExplorativeLVPass::Metric::Disable),
-    cl::values(clEnumValN(ExplorativeLVPass::Metric::Disable, "disable",
-                          "Disable explorative loop vectorization"),
-               clEnumValN(ExplorativeLVPass::Metric::InstCount, "inst-count",
-                          "Count instructions"),
-               clEnumValN(ExplorativeLVPass::Metric::MCA, "mca",
-                          "Use llvm-mca"),
-               clEnumValN(ExplorativeLVPass::Metric::Benchmark, "benchmark",
-                          "Benchmark")));
-
-// Used by MachineCodeExplorer
-cl::opt<bool> XLVPlain("xlv-plain", cl::Hidden, cl::init(false),
-                       cl::desc("If loop exploration is enabled, use "
-                                "entire function for cost calculation"));
+// Defined in TargetPassConfig.cpp
+extern cl::opt<ExplorativeLVPass::Metric> XLVMetric;
 
 } // namespace llvm
 

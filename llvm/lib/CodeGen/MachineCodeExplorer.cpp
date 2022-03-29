@@ -35,9 +35,11 @@ struct MachineCodeExplorer : public MachineFunctionPass {
   bool runOnMachineFunction(MachineFunction &F) override;
 };
 
-extern cl::opt<bool> XLVPlain;
-
 } // namespace llvm
+
+static cl::opt<bool> MCEPlain("mce-explore-plain", cl::Hidden, cl::init(false),
+                              cl::desc("If loop exploration is enabled, use "
+                                       "entire function for cost calculation"));
 
 // The simple, code-size bound approach: count how
 // many MachineInsts the function contains
@@ -56,7 +58,7 @@ static uint64_t getCodeSizeEvaluation(MachineFunction &Fn, unsigned VF) {
       return ExplorativeLVPass::InvalidCosts;
   }
 
-  if (XLVPlain)
+  if (MCEPlain)
     return Fn.getInstructionCount();
 
   unsigned VectorCount = 0;
