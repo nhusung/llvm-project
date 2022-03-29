@@ -269,6 +269,7 @@ namespace {
 class LoopModuleBuilder : public ValueMaterializer {
   const Function &OrigFunc;
   const Loop &L;
+  const unsigned LoopNo;
   ScalarEvolution &SE;
 
   Module *M = nullptr;
@@ -289,10 +290,10 @@ class LoopModuleBuilder : public ValueMaterializer {
   void buildFuncTy();
 
 public:
-  LoopModuleBuilder(const Function &OrigFunc, Loop &L, ScalarEvolution &SE,
-                    bool MakeExecutable = false)
-      : OrigFunc(OrigFunc), L(L), SE(SE), Mapper(VMap, RF_None, nullptr, this),
-        MakeExecutable(MakeExecutable){};
+  LoopModuleBuilder(const Function &OrigFunc, Loop &L, unsigned LoopNo,
+                    ScalarEvolution &SE, bool MakeExecutable = false)
+      : OrigFunc(OrigFunc), L(L), LoopNo(LoopNo), SE(SE),
+        Mapper(VMap, RF_None, nullptr, this), MakeExecutable(MakeExecutable){};
   virtual ~LoopModuleBuilder() { delete M; }
 
   Value *materialize(Value *V) override;
@@ -520,7 +521,8 @@ Function *LoopModuleBuilder::buildLoopFunc(unsigned VF, unsigned IF,
                                            unsigned UF) {
   Function *LoopFunc = Function::Create(
       FuncTy, GlobalValue::ExternalLinkage, OrigFunc.getAddressSpace(),
-      OrigFunc.getName() + "." + Twine(VF) + "." + Twine(IF) + "." + Twine(UF),
+      OrigFunc.getName() + "." + Twine(LoopNo) + "." + Twine(VF) + "." +
+          Twine(IF) + "." + Twine(UF),
       M);
 
   LLVMContext &C = LoopFunc->getContext();
@@ -1138,7 +1140,7 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, unsigned LoopNo,
                                     TargetLibraryInfo &TLI) {
   assert(OptPipeline && "OptPipeline not initialized");
 
-  LoopModuleBuilder Builder(F, L, SE, XLVMetric == Metric::Benchmark);
+  LoopModuleBuilder Builder(F, L, LoopNo, SE, XLVMetric == Metric::Benchmark);
   Module *M = Builder.getModule();
   if (!M)
     return true;
@@ -1331,7 +1333,9 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, unsigned LoopNo,
       return true;
     }
     SmallString<32> ExecPath;
-    sys::fs::createTemporaryFile("explorative-lv", "", ExecPath);
+    sys::fs::createTemporaryFile(Twine("explorative-lv-") + F.getName() + "-" +
+                                     Twine(LoopNo),
+                                 "", ExecPath);
     FileRemover ExecRemover(ExecPath);
     if (sys::ExecuteAndWait(CCPath.get(), {"cc", "-o", ExecPath, ObjectPath}) !=
         0) {
