@@ -1155,16 +1155,17 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, unsigned LoopNo,
   unsigned BestUF = 0;
   uint64_t MinCosts = InvalidCosts;
 
-  auto UpdateBest = [this, Func = F.getName(), LoopNo, &BestVF, &BestIF,
-                     &BestUF, &MinCosts](unsigned VF, unsigned IF, unsigned UF,
-                                         uint64_t Costs,
-                                         uint64_t Reference = InvalidCosts) {
+  auto UpdateBest = [this, Func = F.getName(), LoopNo, LoopName = L.getName(),
+                     &BestVF, &BestIF, &BestUF, &MinCosts](
+                        unsigned VF, unsigned IF, unsigned UF, uint64_t Costs,
+                        uint64_t Reference = InvalidCosts) {
     if (CSVOutput) {
       // We use the following columns:
       // - timestamp (secs since unix epoch)
       // - metric ("inst-count"/"mca"/"benchmark")
       // - function name
       // - loop number
+      // - name of loop header basic block
       // - VF
       // - IF
       // - UF
@@ -1184,8 +1185,8 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, unsigned LoopNo,
         CSVOutput->OS << "benchmark,";
         break;
       }
-      CSVOutput->OS << Func << ',' << LoopNo << ',' << VF << ',' << IF << ','
-                    << UF << ',';
+      CSVOutput->OS << Func << ',' << LoopNo << ',' << LoopName << ',' << VF
+                    << ',' << IF << ',' << UF << ',';
       if (Costs != InvalidCosts)
         CSVOutput->OS << Costs;
       CSVOutput->OS << ',';
@@ -2028,8 +2029,8 @@ PreservedAnalyses ExplorativeLVPass::run(Function &F,
   unsigned LoopNo = 0;
   do {
     Loop *L = Worklist.pop_back_val();
-    LLVM_DEBUG(dbgs() << "XLV: --- processing loop " << LoopNo << " in "
-                      << F.getName() << " ---\n");
+    LLVM_DEBUG(dbgs() << "XLV: --- processing loop " << LoopNo << " '"
+                      << L->getName() << "' in " << F.getName() << " ---\n");
     if (processLoop(F, *L, LoopNo, SE, TLI)) {
       LLVM_DEBUG(dbgs() << "XLV: processing loop failed, letting the "
                            "AutoVectorizer determine VF and IF\n");
