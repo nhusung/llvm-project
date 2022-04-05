@@ -400,8 +400,9 @@ Value *LoopModuleBuilder::materialize(Value *V) {
 
   if (const GlobalVariable *GV = dyn_cast<GlobalVariable>(GVal)) {
     GlobalVariable *NGV = new GlobalVariable(
-        *M, GV->getValueType(), GV->isConstant(), GV->getLinkage(), nullptr,
-        GV->getName() + ".l", nullptr, GV->getThreadLocalMode(),
+        *M, GV->getValueType(), GV->isConstant(),
+        MakeExecutable ? GV->getLinkage() : GlobalValue::ExternalLinkage,
+        nullptr, GV->getName() + ".l", nullptr, GV->getThreadLocalMode(),
         GV->getAddressSpace());
 
     NGV->copyAttributesFrom(GV);
@@ -431,9 +432,9 @@ Value *LoopModuleBuilder::materialize(Value *V) {
 
   if (const Function *F = dyn_cast<Function>(GVal)) {
     if (!MakeExecutable) {
-      Function *NF = Function::Create(cast<FunctionType>(F->getValueType()),
-                                      GlobalValue::ExternalLinkage,
-                                      F->getName() + ".l", M);
+      Function *NF = Function::Create(
+          cast<FunctionType>(F->getValueType()), GlobalValue::ExternalLinkage,
+          F->getAddressSpace(), F->getName() + ".l", M);
       NF->copyAttributesFrom(F);
       return NF;
     }
@@ -442,8 +443,9 @@ Value *LoopModuleBuilder::materialize(Value *V) {
       // We only call intrinsics.
       return Constant::getNullValue(F->getType());
 
-    Function *NF = Function::Create(cast<FunctionType>(F->getValueType()),
-                                    F->getLinkage(), F->getName(), M);
+    Function *NF =
+        Function::Create(cast<FunctionType>(F->getValueType()), F->getLinkage(),
+                         F->getAddressSpace(), F->getName(), M);
     NF->copyAttributesFrom(F);
     return NF;
   }
@@ -935,8 +937,9 @@ void LoopModuleBuilder::buildMainFuncBody() {
   ReturnInst::Create(C, CCountPhi, CEvalBB);
 
   // Declare & define `int main(void)`
-  Function *MainFunc = Function::Create(
-      FunctionType::get(IntTy, false), GlobalValue::ExternalLinkage, "main", M);
+  Function *MainFunc =
+      Function::Create(FunctionType::get(IntTy, false),
+                       GlobalValue::ExternalLinkage, 0, "main", M);
 
   BasicBlock *MainBB = BasicBlock::Create(C, "main", MainFunc);
   CallInst *NRuns =
