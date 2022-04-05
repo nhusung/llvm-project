@@ -1341,8 +1341,19 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, unsigned LoopNo,
                                      Twine(LoopNo),
                                  "", ExecPath);
     FileRemover ExecRemover(ExecPath);
-    if (sys::ExecuteAndWait(CCPath.get(), {"cc", "-o", ExecPath, ObjectPath}) !=
-        0) {
+
+    SmallVector<StringRef, 5> CCOpts;
+    CCOpts.push_back("cc");
+    if (!TM->isPositionIndependent())
+      // Some systems appear to generate position independent executables by
+      // default, but we do not necessarily generate position independent code
+      // as well.
+      CCOpts.push_back("-no-pie");
+    CCOpts.push_back("-o");
+    CCOpts.push_back(ExecPath);
+    CCOpts.push_back(ObjectPath);
+
+    if (sys::ExecuteAndWait(CCPath.get(), CCOpts) != 0) {
       errs() << "XLV: linking failed.  You can find the object file at "
              << ObjectPath << '\n';
       ObjectRemover.releaseFile();
