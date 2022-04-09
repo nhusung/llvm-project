@@ -1235,7 +1235,7 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, unsigned LoopNo,
           Body(VF, IF, 0);
           continue;
         }
-        for (unsigned UF = 1; UF <= XLVMaxUF; UF *= 2)
+        for (unsigned UF = 1; UF <= XLVMaxUF; ++UF)
           Body(VF, IF, UF);
         if (FullUnroll)
           Body(VF, IF, FullUnroll);
