@@ -24,6 +24,7 @@
 #define LLVM_TRANSFORMS_EXPLORATIVELV_H
 
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/IR/Function.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/Passes/PassBuilder.h"
 #include <cassert>
@@ -39,13 +40,20 @@ public:
   enum class Metric { Disable, InstCount, MCA, Benchmark };
 
   friend struct MachineCodeExplorer;
-  static const uint64_t InvalidCosts = UINT64_MAX;
 
-  struct EvaluationInfo {
+  struct LoopFuncInfo {
     unsigned VF, IF, UF;
-    uint64_t Costs = InvalidCosts;
-    EvaluationInfo(unsigned VF, unsigned IF, unsigned UF)
+    bool FullUnroll = false;
+    Function *Func = nullptr;
+    double Costs = INFINITY;
+    LoopFuncInfo(unsigned VF, unsigned IF, unsigned UF)
         : VF(VF), IF(IF), UF(UF) {}
+
+    void reset() {
+      FullUnroll = false;
+      Func = nullptr;
+      Costs = INFINITY;
+    }
   };
 
 private:
@@ -71,13 +79,14 @@ private:
   // pipelines.  This is used to pass them back to the "parent" pipeline.
   InputBuilder *InferredInputs = nullptr;
 
-  DenseMap<Function *, EvaluationInfo> *EvaluationInfoMap = nullptr;
-  EvaluationInfo *getEvalutaionInfo(const Function &F) {
-    assert(EvaluationInfoMap && "No EvaluationInfoMap present");
-    auto It = EvaluationInfoMap->find(&F);
-    return It == EvaluationInfoMap->end() ? nullptr : &It->getSecond();
+  SmallVector<LoopFuncInfo, 0> LoopFuncInfos;
+  DenseMap<Function *, unsigned> LoopFuncInfoMap;
+  LoopFuncInfo *getLoopFuncInfo(const Function &F) {
+    auto It = LoopFuncInfoMap.find(&F);
+    return It == LoopFuncInfoMap.end() ? nullptr : &LoopFuncInfos[It->second];
   }
 
+  struct CostAccumulator;
   struct CSVOutputContainer;
   CSVOutputContainer *CSVOutput = nullptr;
 
@@ -90,8 +99,8 @@ public:
       : TM(Pass.TM), PTO(std::move(Pass.PTO)), PGOOpt(std::move(Pass.PGOOpt)),
         OptPipeline(Pass.OptPipeline), NullCGPipeline(Pass.NullCGPipeline),
         CSVOutput(Pass.CSVOutput) {
-    assert(!EvaluationInfoMap && "EvaluationInfoMap present during move");
-    assert(!InferredInputs && "InferredInputs present during move");
+    assert(LoopFuncInfoMap.size() == 0 &&
+           "LoopFuncInfoMap present during move");
 
     Pass.OptPipeline = nullptr;
     Pass.NullCGPipeline = nullptr;

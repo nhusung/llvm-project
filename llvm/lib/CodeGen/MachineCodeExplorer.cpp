@@ -12,11 +12,13 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Analysis/ExplorativeLV.h"
+#include "llvm/CodeGen/MIRPrinter.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/Passes.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Transforms/Vectorize/ExplorativeLV.h"
+#include <cmath>
 
 using namespace llvm;
 
@@ -43,7 +45,7 @@ static cl::opt<bool> MCEPlain("mce-explore-plain", cl::Hidden, cl::init(false),
 
 // The simple, code-size bound approach: count how
 // many MachineInsts the function contains
-static uint64_t getCodeSizeEvaluation(MachineFunction &Fn, unsigned VF) {
+static double getCodeSizeEvaluation(MachineFunction &Fn, unsigned VF) {
   if (VF > 1) {
     bool Vectorized = false;
     // If we expected to vectorize, only proceed if there is evidence
@@ -55,7 +57,7 @@ static uint64_t getCodeSizeEvaluation(MachineFunction &Fn, unsigned VF) {
       }
     }
     if (!Vectorized)
-      return ExplorativeLVPass::InvalidCosts;
+      return INFINITY;
   }
 
   if (MCEPlain)
@@ -80,11 +82,16 @@ bool MachineCodeExplorer::runOnMachineFunction(MachineFunction &MF) {
   if (!Pass)
     return true;
 
-  ExplorativeLVPass::EvaluationInfo *Result =
-      Pass->getEvalutaionInfo(MF.getFunction());
+  ExplorativeLVPass::LoopFuncInfo *Result =
+      Pass->getLoopFuncInfo(MF.getFunction());
   if (!Result)
     return true;
 
+  LLVM_DEBUG({
+    dbgs() << "MCE: machine function\n";
+    printMIR(dbgs(), MF);
+    dbgs() << "MCE: end machine function\n";
+  });
   Result->Costs = getCodeSizeEvaluation(MF, Result->VF);
   return true;
 }
