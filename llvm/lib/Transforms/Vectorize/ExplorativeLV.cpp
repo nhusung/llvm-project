@@ -1405,7 +1405,7 @@ struct ExplorativeLVPass::CostAccumulator {
 
   void update(unsigned VF, unsigned IF, unsigned UF, double Costs,
               uint64_t Reference = 0) {
-    if (isinf(Costs)) {
+    if (std::isinf(Costs)) {
       LLVM_DEBUG(dbgs() << "XLV: costs for VF " << VF << ", IF " << IF
                         << ", UF " << UF << ": (invalid)\n");
       return;
@@ -1542,7 +1542,7 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, unsigned LoopNo,
     unsigned FullUnroll = Builder.getFullUnrollCount();
     auto Callback = [this, &Best, FullUnroll](unsigned ID, double Costs) {
       LoopFuncInfo &Info = LoopFuncInfos[ID];
-      if (!isinf(Costs)) {
+      if (!std::isinf(Costs)) {
         if (Info.FullUnroll) {
           assert(FullUnroll > 0);
           Costs /= FullUnroll;
