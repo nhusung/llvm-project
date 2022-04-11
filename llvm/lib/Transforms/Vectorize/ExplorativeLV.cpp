@@ -23,6 +23,7 @@
 #include "llvm/Transforms/Vectorize/ExplorativeLV.h"
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Analysis/CFG.h"
@@ -124,9 +125,6 @@ static cl::opt<unsigned>
     XLVBenchmarkLoopSize("xlv-benchmark-loop-size", cl::Hidden, cl::init(32),
                          cl::desc("In benchmarking mode: size (loop "
                                   "function calls) of the benchmark loop"));
-static cl::opt<bool>
-    XLVBenchmarkKeepExec("xlv-benchmark-keep-exec", cl::Hidden, cl::init(false),
-                         cl::desc("In benchmarking mode: keep the executable"));
 
 static cl::opt<bool>
     XLVRandomizeOrder("xlv-randomize-order", cl::Hidden, cl::init(false),
@@ -137,18 +135,52 @@ static cl::opt<std::string> XLVForceFactors(
     cl::desc("Enforce VF/IF/UF for the given functions and loop names.  "
              "Example: 'main,for.body.9.i,4,1,8;func,for.body.42,2,2,5'"));
 
+static cl::opt<std::string>
+    XLVArtifactsDir("xlv-artifacts-dir", cl::Hidden, cl::init(""),
+                    cl::desc("Collect build artifacts in this directory"));
 static cl::opt<bool>
     XLVDumpFuncIR("xlv-dump-func-ir", cl::Hidden, cl::init(false),
                   cl::desc("If true, print the loop function used for "
                            "explorative vectorization to stderr"));
-static cl::opt<bool> XLVDumpModuleIR(
-    "xlv-dump-module-ir", cl::Hidden, cl::init(false),
-    cl::desc("If true, add a PrintModulePass at the beginning of the "
-             "explorative codegen pipeline, printing to stdout"));
 static cl::opt<std::string>
     XLVCSVOut("xlv-csv-out", cl::Hidden, cl::init(""),
               cl::desc("Print explorative loop vectorization results as CSV to "
                        "the given file"));
+
+namespace {
+
+struct Artifact {
+  SmallString<32> Path;
+
+  ~Artifact() {
+    if (XLVArtifactsDir.empty())
+      sys::fs::remove(Path);
+  }
+
+  std::error_code create(const Twine &Prefix, StringRef Suffix, int &ResultFD,
+                         sys::fs::OpenFlags Flags = llvm::sys::fs::OF_None) {
+    if (XLVArtifactsDir.empty())
+      return sys::fs::createTemporaryFile(Prefix, Suffix, ResultFD, Path,
+                                          Flags);
+    const char *Middle = Suffix.empty() ? "" : ".";
+    (XLVArtifactsDir + sys::path::get_separator() + Prefix + Middle + Suffix)
+        .toStringRef(Path);
+    return sys::fs::openFile(Path, ResultFD, sys::fs::CD_CreateAlways,
+                             sys::fs::FA_Read | sys::fs::FA_Write, Flags);
+  }
+
+  std::error_code create(const Twine &Prefix, StringRef Suffix,
+                         sys::fs::OpenFlags Flags = llvm::sys::fs::OF_None) {
+    if (XLVArtifactsDir.empty())
+      return sys::fs::createTemporaryFile(Prefix, Suffix, Path, Flags);
+    const char *Middle = Suffix.empty() ? "" : ".";
+    (XLVArtifactsDir + sys::path::get_separator() + Prefix + Middle + Suffix)
+        .toStringRef(Path);
+    return std::error_code();
+  }
+};
+
+} // end anonymous namespace
 
 class ExplorativeLVPass::InputBuilder {
   class MemAccessRange {
@@ -956,7 +988,7 @@ void LoopModuleBuilder::buildMainFuncBody(
 } // end anonymous namespace
 
 static void addMCAAnnotation(LLVMContext &C, BasicBlock &First,
-                             BasicBlock &Last, Twine ID) {
+                             BasicBlock &Last, const Twine &ID) {
   const char SideEffects[] = "~{memory},~{dirflag},~{fpsr},~{flags}";
   FunctionType *Ty = FunctionType::get(Type::getVoidTy(C), false);
 
@@ -1104,8 +1136,9 @@ static std::string getMainExecutable(const char *Name) {
 //
 // Returns whether errors occured
 template <typename FuncT>
-static bool performMCACostCalc(StringRef FileName, StringRef TargetCPU,
-                               StringRef TargetTriple, FuncT Callback) {
+static bool performMCACostCalc(StringRef FileName, const Twine &OutputStem,
+                               StringRef TargetCPU, StringRef TargetTriple,
+                               FuncT Callback) {
   // Find llvm-mca executable
   // FIXME: do this only once
   auto MCAExecPath =
@@ -1116,21 +1149,20 @@ static bool performMCACostCalc(StringRef FileName, StringRef TargetCPU,
   }
 
   // Build the most specific command line we can generate from the info in TM
-  SmallString<32> MCAOutPath;
-  sys::fs::createTemporaryFile("llvm-mca-out", "json", MCAOutPath);
-  FileRemover MCAOutRemover(MCAOutPath);
+  Artifact MCAOutFile;
+  MCAOutFile.create(OutputStem, "json");
   if (sys::ExecuteAndWait(
           MCAExecPath.get(),
           {"llvm-mca", "--mcpu=" + TargetCPU.str(),
            "--mtriple=" + TargetTriple.str(), "--instruction-info=false",
            "--resource-pressure=false", "--json", FileName},
-          None, {StringRef(""), MCAOutPath.str(), StringRef("")}) != 0) {
+          None, {StringRef(""), MCAOutFile.Path.str(), StringRef("")}) != 0) {
     errs() << "XLV: executing llvm-mca failed\n";
     return true;
   }
 
   // Read JSON
-  auto MCAOutBuf = MemoryBuffer::getFile(MCAOutPath);
+  auto MCAOutBuf = MemoryBuffer::getFile(MCAOutFile.Path);
   if (!MCAOutBuf) {
     errs() << "XLV: could not read llvm-mca output\n";
     return true;
@@ -1169,9 +1201,6 @@ static bool performMCACostCalc(StringRef FileName, StringRef TargetCPU,
 static void initCodeGen(legacy::PassManager &PM, TargetMachine &TM,
                         ExplorativeLVPass *XLV, const TargetLibraryInfo &TLI,
                         raw_pwrite_stream &OS, CodeGenFileType CGFT) {
-  if (XLVDumpModuleIR)
-    PM.add(createPrintModulePass(outs()));
-
   PM.add(new ExplorativeLVHelper(XLV));
 
   // Add LibraryInfo.
@@ -1277,6 +1306,10 @@ ExplorativeLVPass::ExplorativeLVPass(TargetMachine *TM,
                                      Optional<PGOOptions> PGOOpt)
     : TM(TM), PTO(PTO), PGOOpt(PGOOpt) {
   parseXLVForceFactors(ForcedFactors);
+  if (!XLVArtifactsDir.empty()) {
+    if (sys::fs::create_directories(XLVArtifactsDir))
+      errs() << "XLV: creating artifacts dir failed\n";
+  }
 }
 
 ExplorativeLVPass::~ExplorativeLVPass() {
@@ -1455,6 +1488,24 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, unsigned LoopNo,
   // in MCA mode
   filterOutUnvectorized(LoopFuncInfos, XLVMetric == Metric::MCA);
 
+  if (XLVMetric == Metric::Benchmark)
+    // Build the main function -- no need to optimize it
+    Builder.buildMainFuncBody(LoopFuncInfos);
+
+  if (!XLVArtifactsDir.empty()) {
+    // Print the optimized IR
+    std::error_code EC;
+    raw_fd_ostream OS((XLVArtifactsDir + sys::path::get_separator() +
+                       "xlv-opt-" + F.getName() + "-" + Twine(LoopNo) + ".ll")
+                          .str(),
+                      EC);
+    if (EC) {
+      errs() << "XLV: could not open module IR file\n";
+    } else {
+      OS << *M;
+    }
+  }
+
   CostAccumulator Best(CSVOutput, F.getName(), LoopNo, L.getName());
 
   if (XLVMetric == Metric::InstCount) {
@@ -1476,9 +1527,11 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, unsigned LoopNo,
     }
   } else if (XLVMetric == Metric::MCA) {
     int ASMFD;
-    SmallString<32> ASMPath;
-    sys::fs::createTemporaryFile("explorative-lv", "s", ASMFD, ASMPath);
-    FileRemover ASMRemover(ASMPath);
+    Artifact ASM;
+    if (ASM.create("xlv-" + F.getName() + "-" + Twine(LoopNo), "s", ASMFD)) {
+      dbgs() << "XLV: Failed to create assembly file\n";
+      return true;
+    }
     {
       raw_fd_ostream OS(ASMFD, true);
       legacy::PassManager CGPipeline;
@@ -1507,20 +1560,21 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, unsigned LoopNo,
 
     // Perform the cost calculation after the pipeline is deleted to make sure
     // the assembly printer has finished.
-    if (performMCACostCalc(ASMPath, TM->getTargetCPU(), M->getTargetTriple(),
-                           Callback))
+    if (performMCACostCalc(ASM.Path,
+                           "xlv-mca-" + F.getName() + "-" + Twine(LoopNo),
+                           TM->getTargetCPU(), M->getTargetTriple(), Callback))
       return true; // error
   } else {
     assert(XLVMetric == Metric::Benchmark);
 
-    // Build the main function -- no need to optimize it
-    Builder.buildMainFuncBody(LoopFuncInfos);
-
     // Run code generation pipeline
-    SmallString<32> ObjectPath;
+    Artifact Object;
     int ObjectFD;
-    sys::fs::createTemporaryFile("explorative-lv", "o", ObjectFD, ObjectPath);
-    FileRemover ObjectRemover(ObjectPath);
+    if (Object.create("xlv-" + F.getName() + "-" + Twine(LoopNo), "o",
+                      ObjectFD)) {
+      dbgs() << "XLV: Failed to create object file\n";
+      return true;
+    }
     {
       raw_fd_ostream OS(ObjectFD, true);
       legacy::PassManager CGPipeline;
@@ -1534,11 +1588,11 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, unsigned LoopNo,
       errs() << "XLV: could not find cc executable\n";
       return true;
     }
-    SmallString<32> ExecPath;
-    sys::fs::createTemporaryFile(Twine("explorative-lv-") + F.getName() + "-" +
-                                     Twine(LoopNo),
-                                 "", ExecPath);
-    FileRemover ExecRemover(ExecPath);
+    Artifact Exec;
+    if (Exec.create("xlv-" + F.getName() + "-" + Twine(LoopNo), "")) {
+      dbgs() << "XLV: Failed to create executable file\n";
+      return true;
+    }
 
     SmallVector<StringRef, 5> CCOpts;
     CCOpts.push_back("cc");
@@ -1548,19 +1602,12 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, unsigned LoopNo,
       // as well.
       CCOpts.push_back("-no-pie");
     CCOpts.push_back("-o");
-    CCOpts.push_back(ExecPath);
-    CCOpts.push_back(ObjectPath);
+    CCOpts.push_back(Exec.Path);
+    CCOpts.push_back(Object.Path);
 
     if (sys::ExecuteAndWait(CCPath.get(), CCOpts) != 0) {
-      errs() << "XLV: linking failed.  You can find the object file at "
-             << ObjectPath << '\n';
-      ObjectRemover.releaseFile();
+      errs() << "XLV: linking failed\n";
       return true;
-    }
-    if (XLVBenchmarkKeepExec) {
-      dbgs() << "XLV: keeping the benchmarking executable at " << ExecPath
-             << '\n';
-      ExecRemover.releaseFile();
     }
 
     // Count the functions that are benchmarked.  We use this when reading the
@@ -1576,23 +1623,25 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, unsigned LoopNo,
     unsigned TimeoutS = 1 + 2 * (FuncCount + 1) * XLVBenchmarkUSecs / 1000000;
     LLVM_DEBUG(dbgs() << "XLV: benchmarking for up to " << TimeoutS
                       << " s ...\n");
-    SmallString<32> BenchResPath;
-    sys::fs::createTemporaryFile("explorative-lv-out", "txt", BenchResPath);
-    FileRemover BenchResRemover(BenchResPath);
+    Artifact BenchResFile;
+    if (BenchResFile.create("xlv-out-" + F.getName() + "-" + Twine(LoopNo),
+                            "txt")) {
+      errs() << "XLV: failed to open benchmark result file\n";
+      return true;
+    }
     int RetCode = sys::ExecuteAndWait(
-        ExecPath, {"explorative-lv"}, None,
-        {StringRef(""), BenchResPath.str(), StringRef("")}, TimeoutS);
+        Exec.Path, {"explorative-lv"}, None,
+        {StringRef(""), BenchResFile.Path.str(), StringRef("")}, TimeoutS);
     if (RetCode == -2) {
       errs() << "XLV: benchmarking failed/timed out\n";
       return true;
     }
     if (RetCode == -1) {
-      errs() << "XLV: failed to execute " << ExecPath << '\n';
-      ExecRemover.releaseFile();
+      errs() << "XLV: failed to execute\n";
       return true;
     }
 
-    auto BenchResBuf = MemoryBuffer::getFile(BenchResPath);
+    auto BenchResBuf = MemoryBuffer::getFile(BenchResFile.Path);
     if (!BenchResBuf) {
       errs() << "XLV: could not load benchmarking results\n";
       return true;
