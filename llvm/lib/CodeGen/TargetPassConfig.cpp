@@ -232,7 +232,10 @@ cl::opt<ExplorativeLVPass::Metric> XLVMetric(
                clEnumValN(ExplorativeLVPass::Metric::MCA, "mca",
                           "Use llvm-mca"),
                clEnumValN(ExplorativeLVPass::Metric::Benchmark, "benchmark",
-                          "Benchmark")));
+                          "Benchmark"),
+               clEnumValN(ExplorativeLVPass::Metric::Dummy, "dummy",
+                          "Enable the pass but do not explore anything.  Useful "
+                          "in conjunction with --xlv-force-factors.")));
 } // namespace llvm
 
 /// Option names for limiting the codegen pipeline.

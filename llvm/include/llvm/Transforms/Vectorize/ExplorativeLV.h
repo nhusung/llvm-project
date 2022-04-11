@@ -28,6 +28,7 @@
 #include "llvm/IR/PassManager.h"
 #include "llvm/Passes/PassBuilder.h"
 #include <cassert>
+#include <tuple>
 
 namespace llvm {
 
@@ -37,7 +38,7 @@ class ExplorativeLVPass : public PassInfoMixin<ExplorativeLVPass> {
 public:
   class InputBuilder;
 
-  enum class Metric { Disable, InstCount, MCA, Benchmark };
+  enum class Metric { Disable, Dummy, InstCount, MCA, Benchmark };
 
   friend struct MachineCodeExplorer;
 
@@ -90,15 +91,17 @@ private:
   struct CSVOutputContainer;
   CSVOutputContainer *CSVOutput = nullptr;
 
+  StringMap<std::tuple<unsigned, unsigned, unsigned>> ForcedFactors;
+
 public:
   ExplorativeLVPass(TargetMachine *TM, PipelineTuningOptions PTO,
-                    Optional<PGOOptions> PGOOpt)
-      : TM(TM), PTO(PTO), PGOOpt(PGOOpt) {}
+                    Optional<PGOOptions> PGOOpt);
 
   ExplorativeLVPass(ExplorativeLVPass &&Pass)
       : TM(Pass.TM), PTO(std::move(Pass.PTO)), PGOOpt(std::move(Pass.PGOOpt)),
         OptPipeline(Pass.OptPipeline), NullCGPipeline(Pass.NullCGPipeline),
-        CSVOutput(Pass.CSVOutput) {
+        CSVOutput(Pass.CSVOutput),
+        ForcedFactors(std::move(Pass.ForcedFactors)) {
     assert(LoopFuncInfoMap.size() == 0 &&
            "LoopFuncInfoMap present during move");
 

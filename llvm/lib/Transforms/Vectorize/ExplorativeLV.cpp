@@ -132,6 +132,11 @@ static cl::opt<bool>
     XLVRandomizeOrder("xlv-randomize-order", cl::Hidden, cl::init(false),
                       cl::desc("Randomize the order of the loop functions"));
 
+static cl::opt<std::string> XLVForceFactors(
+    "xlv-force-factors", cl::Hidden, cl::init(""),
+    cl::desc("Enforce VF/IF/UF for the given functions and loop names.  "
+             "Example: 'main,for.body.9.i,4,1,8;func,for.body.42,2,2,5'"));
+
 static cl::opt<bool>
     XLVDumpFuncIR("xlv-dump-func-ir", cl::Hidden, cl::init(false),
                   cl::desc("If true, print the loop function used for "
@@ -951,17 +956,14 @@ void LoopModuleBuilder::buildMainFuncBody(
 } // end anonymous namespace
 
 static void addMCAAnnotation(LLVMContext &C, BasicBlock &First,
-                             BasicBlock &Last, StringRef ID) {
+                             BasicBlock &Last, Twine ID) {
   const char SideEffects[] = "~{memory},~{dirflag},~{fpsr},~{flags}";
   FunctionType *Ty = FunctionType::get(Type::getVoidTy(C), false);
 
-  std::string StartComment = "# LLVM-MCA-BEGIN ";
-  std::string EndComment = "# LLVM-MCA-END ";
-  StartComment += ID;
-  EndComment += ID;
-
-  InlineAsm *StartAsm = InlineAsm::get(Ty, StartComment, SideEffects, true);
-  InlineAsm *EndAsm = InlineAsm::get(Ty, EndComment, SideEffects, true);
+  InlineAsm *StartAsm =
+      InlineAsm::get(Ty, ("# LLVM-MCA-BEGIN " + ID).str(), SideEffects, true);
+  InlineAsm *EndAsm =
+      InlineAsm::get(Ty, ("# LLVM-MCA-END " + ID).str(), SideEffects, true);
 
   CallInst::Create(Ty, StartAsm, "", First.getFirstNonPHI());
   CallInst::Create(Ty, EndAsm, "", Last.getTerminator());
@@ -1050,7 +1052,7 @@ static void filterOutUnvectorized(
       if (Latch) {
         if (AddMCAAnnotations)
           addMCAAnnotation(F.getContext(), getMCAStart(F, *Latch), *Latch,
-                           std::to_string(I));
+                           Twine(I));
         continue;
       }
     } else {
@@ -1069,7 +1071,7 @@ static void filterOutUnvectorized(
       BasicBlock &BB = BBs.front();
       if (Info.VF == 1) {
         if (AddMCAAnnotations)
-          addMCAAnnotation(F.getContext(), BB, BB, std::to_string(I));
+          addMCAAnnotation(F.getContext(), BB, BB, Twine(I));
         continue;
       }
 
@@ -1077,7 +1079,7 @@ static void filterOutUnvectorized(
       for (Instruction &Inst : BB) {
         if (Inst.getType()->isVectorTy()) {
           if (AddMCAAnnotations)
-            addMCAAnnotation(F.getContext(), BB, BB, std::to_string(I));
+            addMCAAnnotation(F.getContext(), BB, BB, Twine(I));
           continue;
         }
       }
@@ -1251,6 +1253,31 @@ struct ExplorativeLVPass::CSVOutputContainer {
   raw_fd_ostream OS;
   CSVOutputContainer() : OS(XLVCSVOut, EC) {}
 };
+
+static void parseXLVForceFactors(
+    StringMap<std::tuple<unsigned, unsigned, unsigned>> &ForcedFactors) {
+  StringRef Remainder = StringRef(XLVForceFactors), LoopEntry, FacStr;
+  while (!Remainder.empty()) {
+    std::tie(LoopEntry, Remainder) = StringRef(XLVForceFactors).split(';');
+
+    unsigned Factors[3];
+    for (int I = 2; I >= 0; --I) {
+      std::tie(LoopEntry, FacStr) = LoopEntry.rsplit(',');
+      if (FacStr.getAsInteger(10, Factors[I])) {
+        errs() << "XLV: error parsing --xlv-force-factors\n";
+        return;
+      }
+    }
+    ForcedFactors.try_emplace(LoopEntry, Factors[0], Factors[1], Factors[2]);
+  }
+}
+
+ExplorativeLVPass::ExplorativeLVPass(TargetMachine *TM,
+                                     PipelineTuningOptions PTO,
+                                     Optional<PGOOptions> PGOOpt)
+    : TM(TM), PTO(PTO), PGOOpt(PGOOpt) {
+  parseXLVForceFactors(ForcedFactors);
+}
 
 ExplorativeLVPass::~ExplorativeLVPass() {
   delete NullCGPipeline;
@@ -2199,52 +2226,55 @@ PreservedAnalyses ExplorativeLVPass::run(Function &F,
   if (Worklist.empty())
     return PreservedAnalyses::all();
 
-  // Initialize pipeline only if there is something to do.
-  if (!OptPipeline)
-    OptPipeline = new OptPipelineContainer(TM, PTO, PGOOpt, this, TLI);
-  // If this is a code size evaluation, we can re-use the same backend pipeline.
-  if (!NullCGPipeline && XLVMetric == Metric::InstCount)
-    NullCGPipeline = new NullCGPipelineContainer(*TM, this, TLI);
+  if (XLVMetric != Metric::Dummy) {
+    // Initialize pipeline only if there is something to do.
+    if (!OptPipeline)
+      OptPipeline = new OptPipelineContainer(TM, PTO, PGOOpt, this, TLI);
+    // If this is a code size evaluation, we can re-use the same backend
+    // pipeline.
+    if (!NullCGPipeline && XLVMetric == Metric::InstCount)
+      NullCGPipeline = new NullCGPipelineContainer(*TM, this, TLI);
 
-  if (!CSVOutput && !XLVCSVOut.empty()) {
-    CSVOutput = new CSVOutputContainer();
-    if (CSVOutput->EC) {
-      errs() << "XLV: could not open " << XLVCSVOut << ": "
-             << CSVOutput->EC.message() << '\n';
-      delete CSVOutput;
-      CSVOutput = nullptr;
-    }
-  }
-
-  if (LoopFuncInfos.size() == 0) {
-    /* Generate factors we want to explore */
-    unsigned VFCount = pow2Count(XLVMaxVF);
-    unsigned IFCount = pow2Count(XLVMaxIF);
-    if (XLVMetric == Metric::InstCount || XLVMaxUF == 0) {
-      // For the InstCount metric, we only consider UF 1, everything else should
-      // not interesting when counting instructions.
-      unsigned UF = XLVMetric == Metric::InstCount ? 1 : 0;
-      LoopFuncInfos.reserve(VFCount * IFCount);
-      for (unsigned VF = 1; VF <= XLVMaxVF; VF *= 2) {
-        for (unsigned IF = 1; IF <= XLVMaxIF; IF *= 2)
-          LoopFuncInfos.emplace_back(VF, IF, UF);
+    if (!CSVOutput && !XLVCSVOut.empty()) {
+      CSVOutput = new CSVOutputContainer();
+      if (CSVOutput->EC) {
+        errs() << "XLV: could not open " << XLVCSVOut << ": "
+               << CSVOutput->EC.message() << '\n';
+        delete CSVOutput;
+        CSVOutput = nullptr;
       }
-    } else {
-      unsigned UFCount = XLVMaxUF + 1;
-      LoopFuncInfos.reserve(VFCount * IFCount * UFCount);
-      for (unsigned VF = 1; VF <= XLVMaxVF; VF *= 2) {
-        for (unsigned IF = 1; IF <= XLVMaxIF; IF *= 2) {
-          for (unsigned UF = 1; UF <= XLVMaxUF; ++UF)
+    }
+
+    if (LoopFuncInfos.size() == 0) {
+      /* Generate factors we want to explore */
+      unsigned VFCount = pow2Count(XLVMaxVF);
+      unsigned IFCount = pow2Count(XLVMaxIF);
+      if (XLVMetric == Metric::InstCount || XLVMaxUF == 0) {
+        // For the InstCount metric, we only consider UF 1, everything else
+        // should not interesting when counting instructions.
+        unsigned UF = XLVMetric == Metric::InstCount ? 1 : 0;
+        LoopFuncInfos.reserve(VFCount * IFCount);
+        for (unsigned VF = 1; VF <= XLVMaxVF; VF *= 2) {
+          for (unsigned IF = 1; IF <= XLVMaxIF; IF *= 2)
             LoopFuncInfos.emplace_back(VF, IF, UF);
-          LoopFuncInfos.emplace_back(VF, IF, UINT_MAX);
+        }
+      } else {
+        unsigned UFCount = XLVMaxUF + 1;
+        LoopFuncInfos.reserve(VFCount * IFCount * UFCount);
+        for (unsigned VF = 1; VF <= XLVMaxVF; VF *= 2) {
+          for (unsigned IF = 1; IF <= XLVMaxIF; IF *= 2) {
+            for (unsigned UF = 1; UF <= XLVMaxUF; ++UF)
+              LoopFuncInfos.emplace_back(VF, IF, UF);
+            LoopFuncInfos.emplace_back(VF, IF, UINT_MAX);
+          }
         }
       }
-    }
 
-    if (XLVRandomizeOrder) {
-      std::random_device RD;
-      std::default_random_engine RNG(RD());
-      std::shuffle(LoopFuncInfos.begin(), LoopFuncInfos.end(), RNG);
+      if (XLVRandomizeOrder) {
+        std::random_device RD;
+        std::default_random_engine RNG(RD());
+        std::shuffle(LoopFuncInfos.begin(), LoopFuncInfos.end(), RNG);
+      }
     }
   }
 
@@ -2253,11 +2283,21 @@ PreservedAnalyses ExplorativeLVPass::run(Function &F,
     Loop *L = Worklist.pop_back_val();
     LLVM_DEBUG(dbgs() << "XLV: --- processing loop " << LoopNo << " '"
                       << L->getName() << "' in " << F.getName() << " ---\n");
-    if (processLoop(F, *L, LoopNo, SE, TLI)) {
-      LLVM_DEBUG(dbgs() << "XLV: processing loop failed, letting the "
-                           "AutoVectorizer determine VF and IF\n");
+    auto It =
+        ForcedFactors.find((F.getName() + Twine(',') + L->getName()).str());
+    if (It != ForcedFactors.end()) {
+      unsigned VF, IF, UF;
+      std::tie(VF, IF, UF) = It->second;
+      LLVM_DEBUG(dbgs() << "XLV: enforcing VF " << VF << ", IF " << IF
+                        << ", UF " << UF << '\n');
+      setFactorMetadata(*L, VF, IF, UF);
+    } else if (XLVMetric != Metric::Dummy) {
+      if (processLoop(F, *L, LoopNo, SE, TLI)) {
+        LLVM_DEBUG(dbgs() << "XLV: processing loop failed, letting the "
+                             "AutoVectorizer determine VF and IF\n");
+      }
+      LoopFuncInfoMap.clear();
     }
-    LoopFuncInfoMap.clear();
     ++LoopNo;
   } while (!Worklist.empty());
 
