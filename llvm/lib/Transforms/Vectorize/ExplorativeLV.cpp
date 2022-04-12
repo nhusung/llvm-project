@@ -1404,7 +1404,7 @@ struct ExplorativeLVPass::CostAccumulator {
         LoopName(LoopName){};
 
   void update(unsigned VF, unsigned IF, unsigned UF, double Costs,
-              uint64_t Reference = 0) {
+              uint64_t NRuns = 1) {
     if (std::isinf(Costs)) {
       LLVM_DEBUG(dbgs() << "XLV: costs for VF " << VF << ", IF " << IF
                         << ", UF " << UF << ": (invalid)\n");
@@ -1420,12 +1420,10 @@ struct ExplorativeLVPass::CostAccumulator {
       // - IF
       // - UF
       // - costs (empty if invalid)
-      // - reference (number of runs if in benchmarking mode, else empty)
+      // - number of runs
       CSVOutput->OS << Func << ',' << LoopNo << ',' << LoopName << ',' << VF
-                    << ',' << IF << ',' << UF << ',' << Costs << ',';
-      if (Reference > 0)
-        CSVOutput->OS << Reference;
-      CSVOutput->OS << '\n';
+                    << ',' << IF << ',' << UF << ',' << Costs << ',' << NRuns
+                    << '\n';
     }
 
     LLVM_DEBUG(dbgs() << "XLV: costs for VF " << VF << ", IF " << IF << ", UF "
