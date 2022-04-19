@@ -28,6 +28,7 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Analysis/CFG.h"
 #include "llvm/Analysis/ExplorativeLV.h"
+#include "llvm/Analysis/LoopAnalysisManager.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/LoopIterator.h"
 #include "llvm/Analysis/ScalarEvolution.h"
@@ -47,6 +48,7 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Metadata.h"
+#include "llvm/IR/PassManager.h"
 #include "llvm/IR/Value.h"
 #include "llvm/Passes/StandardInstrumentations.h"
 #include "llvm/Support/Casting.h"
@@ -130,6 +132,12 @@ static cl::opt<bool>
     XLVRandomizeOrder("xlv-randomize-order", cl::Hidden, cl::init(false),
                       cl::desc("Randomize the order of the loop functions"));
 
+static cl::opt<std::string>
+    XLVOnlyFunc("xlv-only-func", cl::Hidden, cl::init(""),
+                cl::desc("Only consider the given function (after inlining)"));
+static cl::opt<std::string>
+    XLVOnlyLoop("xlv-only-loop", cl::Hidden, cl::init(""),
+                cl::desc("Only consider the given loop (name)"));
 static cl::opt<std::string> XLVForceFactors(
     "xlv-force-factors", cl::Hidden, cl::init(""),
     cl::desc("Enforce VF/IF/UF for the given functions and loop names.  "
@@ -2250,6 +2258,10 @@ PreservedAnalyses ExplorativeLVPass::run(Function &F,
     return PreservedAnalyses::all();
   }
 
+  // main/"parent" pass
+  if (!XLVOnlyFunc.empty() && F.getName() != XLVOnlyFunc)
+    return PreservedAnalyses::all();
+
   // Further analyses needed to run simplifyLoop()
   auto &AC = AM.getResult<AssumptionAnalysis>(F);
   auto &DT = AM.getResult<DominatorTreeAnalysis>(F);
@@ -2328,22 +2340,24 @@ PreservedAnalyses ExplorativeLVPass::run(Function &F,
   unsigned LoopNo = 0;
   do {
     Loop *L = Worklist.pop_back_val();
-    LLVM_DEBUG(dbgs() << "XLV: --- processing loop " << LoopNo << " '"
-                      << L->getName() << "' in " << F.getName() << " ---\n");
-    auto It =
-        ForcedFactors.find((F.getName() + Twine(',') + L->getName()).str());
-    if (It != ForcedFactors.end()) {
-      unsigned VF, IF, UF;
-      std::tie(VF, IF, UF) = It->second;
-      LLVM_DEBUG(dbgs() << "XLV: enforcing VF " << VF << ", IF " << IF
-                        << ", UF " << UF << '\n');
-      setFactorMetadata(*L, VF, IF, UF);
-    } else if (XLVMetric != Metric::Dummy) {
-      if (processLoop(F, *L, LoopNo, SE, TLI)) {
-        LLVM_DEBUG(dbgs() << "XLV: processing loop failed, letting the "
-                             "AutoVectorizer determine VF and IF\n");
+    StringRef LoopName = L->getName();
+    if (XLVOnlyLoop.empty() || LoopName == XLVOnlyLoop) {
+      LLVM_DEBUG(dbgs() << "XLV: --- processing loop " << LoopNo << " '"
+                        << LoopName << "' in " << F.getName() << " ---\n");
+      auto It = ForcedFactors.find((F.getName() + Twine(',') + LoopName).str());
+      if (It != ForcedFactors.end()) {
+        unsigned VF, IF, UF;
+        std::tie(VF, IF, UF) = It->second;
+        LLVM_DEBUG(dbgs() << "XLV: enforcing VF " << VF << ", IF " << IF
+                          << ", UF " << UF << '\n');
+        setFactorMetadata(*L, VF, IF, UF);
+      } else if (XLVMetric != Metric::Dummy) {
+        if (processLoop(F, *L, LoopNo, SE, TLI)) {
+          LLVM_DEBUG(dbgs() << "XLV: processing loop failed, letting the "
+                               "AutoVectorizer determine VF and IF\n");
+        }
+        LoopFuncInfoMap.clear();
       }
-      LoopFuncInfoMap.clear();
     }
     ++LoopNo;
   } while (!Worklist.empty());
