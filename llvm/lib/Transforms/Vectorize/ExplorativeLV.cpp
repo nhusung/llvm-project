@@ -166,7 +166,7 @@ struct Artifact {
   }
 
   std::error_code create(const Twine &Prefix, StringRef Suffix, int &ResultFD,
-                         sys::fs::OpenFlags Flags = llvm::sys::fs::OF_None) {
+                         sys::fs::OpenFlags Flags = sys::fs::OF_None) {
     if (XLVArtifactsDir.empty())
       return sys::fs::createTemporaryFile(Prefix, Suffix, ResultFD, Path,
                                           Flags);
@@ -178,7 +178,7 @@ struct Artifact {
   }
 
   std::error_code create(const Twine &Prefix, StringRef Suffix,
-                         sys::fs::OpenFlags Flags = llvm::sys::fs::OF_None) {
+                         sys::fs::OpenFlags Flags = sys::fs::OF_None) {
     if (XLVArtifactsDir.empty())
       return sys::fs::createTemporaryFile(Prefix, Suffix, Path, Flags);
     const char *Middle = Suffix.empty() ? "" : ".";
@@ -1295,7 +1295,7 @@ static void parseXLVForceFactors(
     StringMap<std::tuple<unsigned, unsigned, unsigned>> &ForcedFactors) {
   StringRef Remainder = StringRef(XLVForceFactors), LoopEntry, FacStr;
   while (!Remainder.empty()) {
-    std::tie(LoopEntry, Remainder) = StringRef(XLVForceFactors).split(';');
+    std::tie(LoopEntry, Remainder) = Remainder.split(';');
 
     unsigned Factors[3];
     for (int I = 2; I >= 0; --I) {
