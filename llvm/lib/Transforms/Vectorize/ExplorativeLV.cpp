@@ -104,6 +104,10 @@ static cl::opt<unsigned> XLVMaxFullUnroll(
     "xlv-max-full-unroll", cl::Hidden, cl::init(0),
     cl::desc("If the loop's trip count is known and below this threshold, "
              "explore the fully unrolled loop as well"));
+static cl::opt<unsigned>
+    XLVMaxCodeSize("xlv-max-code-size", cl::Hidden, cl::init(512),
+                   cl::desc("Limit the loop's code size (useful if an inner "
+                            "loop was fully unrolled)"));
 
 static cl::opt<unsigned> XLVDesiredTripCount(
     "xlv-desired-tripcount", cl::Hidden, cl::init(1024),
@@ -213,6 +217,13 @@ class ExplorativeLVPass::InputBuilder {
 
 public:
   void addMemAccess(const Argument *Arg, int64_t Loc);
+
+  /// Adds a memory access with a known end pointer.
+  ///
+  /// \param ArgStart  the argument corresponding to the start pointer
+  /// \param ArgEnd    the argument corresponding to the end pointer
+  /// \param Diff      the difference between start and end pointer (elements,
+  ///                  not bytes)
   void addMemAccessWithEndptr(const Argument *ArgStart, const Argument *ArgEnd,
                               uint64_t Diff);
 
@@ -330,6 +341,7 @@ class LoopModuleBuilder : public ValueMaterializer {
 
   InputBuilder InferredInputs;
   unsigned FullUnroll = 0;
+  unsigned LoopSize = 0;
 
   bool MakeExecutable;
 
@@ -357,6 +369,7 @@ public:
     return InferredInputs;
   }
   unsigned getFullUnrollCount() { return FullUnroll; }
+  unsigned getLoopSize() { return LoopSize; }
 };
 
 bool LoopModuleBuilder::determineIO() {
@@ -369,6 +382,8 @@ bool LoopModuleBuilder::determineIO() {
   SmallPtrSet<const Value *, 32> ArgSet;
 
   for (const BasicBlock *BB : L.getBlocks()) {
+    LoopSize += BB->size();
+
     for (const Instruction &I : *BB) {
       if (MakeExecutable && isa<CallBase>(I)) {
         // Dealing with call instructions is hard.  If they have external
@@ -522,7 +537,8 @@ Module *LoopModuleBuilder::getModule() {
   if (MakeExecutable) {
     const SCEV *BackedgeTaken = SE.getSymbolicMaxBackedgeTakenCount(&L);
     if (isa<SCEVCouldNotCompute>(BackedgeTaken)) {
-      LLVM_DEBUG(dbgs() << "XLV: cannot infer trip count\n");
+      LLVM_DEBUG(
+          dbgs() << "XLV: cannot infer trip count in original function\n");
       return nullptr;
     }
     if (const SCEVConstant *Const = dyn_cast<SCEVConstant>(BackedgeTaken))
@@ -1471,8 +1487,20 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, unsigned LoopNo,
     LoopFuncInfo &Info = LoopFuncInfos[I];
     Info.reset();
     unsigned FullUnroll = Builder.getFullUnrollCount();
-    if (Info.UF == UINT_MAX &&
-        (FullUnroll > XLVMaxFullUnroll || FullUnroll <= XLVMaxUF)) {
+    unsigned LoopSize = Builder.getLoopSize() * Info.IF;
+    if (Info.UF < UINT_MAX) {
+      if (Info.UF > 0)
+        LoopSize *= Info.UF;
+    } else {
+      if (FullUnroll > XLVMaxFullUnroll || FullUnroll <= XLVMaxUF)
+        continue;
+      LoopSize *= FullUnroll;
+    }
+    if (LoopSize > XLVMaxCodeSize) {
+      LLVM_DEBUG(dbgs() << "XLV: not exploring VF " << Info.VF << ", IF "
+                        << Info.IF << ", UF " << Info.UF
+                        << " because of code size " << LoopSize << " > "
+                        << XLVMaxCodeSize << '\n');
       continue;
     }
     Info.Func = Builder.buildLoopFunc(Info.VF, Info.IF, Info.UF);
@@ -1816,14 +1844,15 @@ class SCEVBackedgeTakenAnalyzer
   ///
   /// Currently, we only permit a single combination of a start and an end
   /// pointer to determine the trip count.  Note that we require arguments here.
-  /// Global variables should not occur, because then the trip count should be
-  /// constant.
+  /// Global variables typically do not occur, because they require a `load`
+  /// instruction, which is typically loop-invariant.  Also, scalar evolution
+  /// analysis appears to fail on them.
   const Argument *InferredPtrStart = nullptr;
 
   /// End pointer value
   const Argument *InferredPtrEnd = nullptr;
 
-  /// Difference between Start and End pointer (if present)
+  /// Difference (bytes) between Start and End pointer (if both are present)
   uint64_t InferredPtrDiff;
 
   SCEVBackedgeTakenAnalyzer(ScalarEvolution &SE, InputBuilder &InferredInputs)
@@ -1954,9 +1983,10 @@ class SCEVBackedgeTakenAnalyzer
   Optional<APInt> visitUnknown(const SCEVUnknown *Unknown, APInt Desired) {
     const Argument *Arg = dyn_cast<Argument>(Unknown->getValue());
     if (!Arg) {
-      // This case should not occur.  Global variables should not occur, because
-      // then the trip count should be constant.  And in our loop function, no
-      // other values are live outside the loop.
+      // This case should not occur.  Global variables typically do not occur,
+      // because they require a `load` instruction, which is typically
+      // loop-invariant.  Also, scalar evolution analysis appears to fail on
+      // them.
       LLVM_DEBUG(dbgs() << "XLV: found non-argument unknown " << Unknown
                         << " when analyzing backedge taken count\n");
       return None;
