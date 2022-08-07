@@ -834,12 +834,12 @@ void LoopModuleBuilder::buildMainFuncBody(
   FunctionType *BenchFuncTy = FunctionType::get(
       Type::getVoidTy(C), {LoopFuncPtrTy, IntTy, IntTy, IntTy, IntTy}, false);
   Function *BenchFunc =
-      Function::Create(BenchFuncTy, GlobalValue::PrivateLinkage, "bench", M);
+      Function::Create(BenchFuncTy, GlobalValue::ExternalLinkage, "bench", M);
   // To infer a suitable n, we build a calibration function that counts the
   // repitions needed until the elapsed time exceeds some threshold.
   FunctionType *CalibFuncTy = FunctionType::get(IntTy, {LoopFuncPtrTy}, false);
   Function *CalibFunc =
-      Function::Create(CalibFuncTy, GlobalValue::PrivateLinkage, "calib", M);
+      Function::Create(CalibFuncTy, GlobalValue::ExternalLinkage, "calib", M);
 
   Argument *FuncArg = BenchFunc->getArg(0);
   FuncArg->setName("func");
