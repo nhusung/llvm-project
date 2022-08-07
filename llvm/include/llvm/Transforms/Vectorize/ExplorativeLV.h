@@ -93,6 +93,29 @@ private:
 
   StringMap<std::tuple<unsigned, unsigned, unsigned>> ForcedFactors;
 
+  struct ProgramPaths {
+    std::string cc() {
+      assert(Status == 1 && !CC.empty());
+      return CC;
+    }
+    std::string mca() {
+      assert(Status == 1 && !MCA.empty());
+      return MCA;
+    }
+    std::string taskset() {
+      assert(Status == 1 && !Taskset.empty());
+      return Taskset;
+    }
+
+    bool findAll();
+
+  private:
+    int Status = 0;
+    std::string CC;
+    std::string MCA;
+    std::string Taskset;
+  } Paths;
+
 public:
   ExplorativeLVPass(TargetMachine *TM, PipelineTuningOptions PTO,
                     Optional<PGOOptions> PGOOpt);
@@ -100,8 +123,8 @@ public:
   ExplorativeLVPass(ExplorativeLVPass &&Pass)
       : TM(Pass.TM), PTO(std::move(Pass.PTO)), PGOOpt(std::move(Pass.PGOOpt)),
         OptPipeline(Pass.OptPipeline), NullCGPipeline(Pass.NullCGPipeline),
-        CSVOutput(Pass.CSVOutput),
-        ForcedFactors(std::move(Pass.ForcedFactors)) {
+        CSVOutput(Pass.CSVOutput), ForcedFactors(std::move(Pass.ForcedFactors)),
+        Paths(std::move(Pass.Paths)) {
     assert(LoopFuncInfoMap.size() == 0 &&
            "LoopFuncInfoMap present during move");
 

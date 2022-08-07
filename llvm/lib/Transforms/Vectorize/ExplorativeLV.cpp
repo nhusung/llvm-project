@@ -26,6 +26,7 @@
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/Twine.h"
 #include "llvm/Analysis/CFG.h"
 #include "llvm/Analysis/ExplorativeLV.h"
 #include "llvm/Analysis/LoopAnalysisManager.h"
@@ -131,6 +132,10 @@ static cl::opt<unsigned>
     XLVBenchmarkLoopSize("xlv-benchmark-loop-size", cl::Hidden, cl::init(32),
                          cl::desc("In benchmarking mode: size (loop "
                                   "function calls) of the benchmark loop"));
+static cl::opt<int> XLVBenchmarkPinCpu(
+    "xlv-benchmark-pin-cpu", cl::Hidden, cl::init(-1),
+    cl::desc("In benchmarking mode: pin the program to a specific core (using "
+             "taskset, only works on Linux)"));
 
 static cl::opt<bool>
     XLVRandomizeOrder("xlv-randomize-order", cl::Hidden, cl::init(false),
@@ -1148,35 +1153,19 @@ static void filterOutUnvectorized(
   }
 }
 
-// From ClangLinkerWrapper
-static std::string getMainExecutable(const char *Name) {
-  void *Ptr = (void *)(intptr_t)&getMainExecutable;
-  auto COWPath = sys::fs::getMainExecutable(Name, Ptr);
-  return sys::path::parent_path(COWPath).str();
-}
-
 // The more complex approach, using the runtime estimation mechanisms
 // already present in LLVM: llvm-mca
 //
 // Returns whether errors occured
 template <typename FuncT>
-static bool performMCACostCalc(StringRef FileName, const Twine &OutputStem,
-                               StringRef TargetCPU, StringRef TargetTriple,
-                               FuncT Callback) {
-  // Find llvm-mca executable
-  // FIXME: do this only once
-  auto MCAExecPath =
-      sys::findProgramByName("llvm-mca", {getMainExecutable("llvm-mca")});
-  if (!MCAExecPath) {
-    errs() << "XLV: could not find llvm-mca executable\n";
-    return true;
-  }
-
+static bool performMCACostCalc(std::string MCAPath, StringRef FileName,
+                               const Twine &OutputStem, StringRef TargetCPU,
+                               StringRef TargetTriple, FuncT Callback) {
   // Build the most specific command line we can generate from the info in TM
   Artifact MCAOutFile;
   MCAOutFile.create(OutputStem, "json");
   if (sys::ExecuteAndWait(
-          MCAExecPath.get(),
+          MCAPath,
           {"llvm-mca", "--mcpu=" + TargetCPU.str(),
            "--mtriple=" + TargetTriple.str(), "--instruction-info=false",
            "--resource-pressure=false", "--json", FileName},
@@ -1594,7 +1583,7 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, unsigned LoopNo,
 
     // Perform the cost calculation after the pipeline is deleted to make sure
     // the assembly printer has finished.
-    if (performMCACostCalc(ASM.Path,
+    if (performMCACostCalc(Paths.mca(), ASM.Path,
                            "xlv-mca-" + F.getName() + "-" + Twine(LoopNo),
                            TM->getTargetCPU(), M->getTargetTriple(), Callback))
       return true; // error
@@ -1617,11 +1606,6 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, unsigned LoopNo,
     }
 
     // Create an executable
-    auto CCPath = sys::findProgramByName("cc"); // FIXME: do this only once
-    if (!CCPath) {
-      errs() << "XLV: could not find cc executable\n";
-      return true;
-    }
     Artifact Exec;
     if (Exec.create("xlv-" + F.getName() + "-" + Twine(LoopNo), "")) {
       dbgs() << "XLV: Failed to create executable file\n";
@@ -1639,7 +1623,7 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, unsigned LoopNo,
     CCOpts.push_back(Exec.Path);
     CCOpts.push_back(Object.Path);
 
-    if (sys::ExecuteAndWait(CCPath.get(), CCOpts) != 0) {
+    if (sys::ExecuteAndWait(Paths.cc(), CCOpts) != 0) {
       errs() << "XLV: linking failed\n";
       return true;
     }
@@ -1663,9 +1647,20 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, unsigned LoopNo,
       errs() << "XLV: failed to open benchmark result file\n";
       return true;
     }
-    int RetCode = sys::ExecuteAndWait(
-        Exec.Path, {"explorative-lv"}, None,
-        {StringRef(""), BenchResFile.Path.str(), StringRef("")}, TimeoutS);
+    int RetCode;
+    if (XLVBenchmarkPinCpu < 0) {
+      RetCode = sys::ExecuteAndWait(
+          Exec.Path, {"explorative-lv"}, None,
+          {StringRef(""), BenchResFile.Path.str(), StringRef("")}, TimeoutS);
+    } else {
+      SmallString<11> CpuId;
+      RetCode = sys::ExecuteAndWait(
+          Paths.taskset(),
+          {"taskset", "-c", Twine(XLVBenchmarkPinCpu).toStringRef(CpuId),
+           Exec.Path},
+          None, {StringRef(""), BenchResFile.Path.str(), StringRef("")},
+          TimeoutS);
+    }
     if (RetCode == -2) {
       errs() << "XLV: benchmarking failed/timed out\n";
       return true;
@@ -2247,6 +2242,52 @@ static void inferInputs(const Function &F, Loop &L, ScalarEvolution &SE,
   }
 }
 
+// From ClangLinkerWrapper
+static std::string getMainExecutable(const char *Name) {
+  void *Ptr = (void *)(intptr_t)&getMainExecutable;
+  auto COWPath = sys::fs::getMainExecutable(Name, Ptr);
+  return sys::path::parent_path(COWPath).str();
+}
+
+bool ExplorativeLVPass::ProgramPaths::findAll() {
+  if (Status == 1)
+    return true;
+  if (Status == -1)
+    return false;
+
+  Status = -1;
+  if (XLVMetric == Metric::Benchmark) {
+    auto CCPath = sys::findProgramByName("cc");
+    if (!CCPath) {
+      errs() << "XLV: could not find cc executable\n";
+      return false;
+    }
+    CC = CCPath.get();
+
+    if (XLVBenchmarkPinCpu >= 0) {
+      auto TasksetPath = sys::findProgramByName("taskset");
+      if (!TasksetPath) {
+        errs() << "XLV: could not find taskset executable\n";
+        return false;
+      }
+      Taskset = TasksetPath.get();
+    }
+  } else if (XLVMetric == Metric::MCA) {
+    // If we only compiled llvm-mca but didn't install it in PATH, we would not
+    // find it.  `getMainExecutable()` is here to help.
+    auto MCAPath =
+        sys::findProgramByName("llvm-mca", {getMainExecutable("llvm-mca")});
+    if (!MCAPath) {
+      errs() << "XLV: could not find taskset executable\n";
+      return false;
+    }
+    MCA = MCAPath.get();
+  }
+
+  Status = 1;
+  return true;
+}
+
 // This is to be replaced by std::bit_width() when we have C++20
 static unsigned pow2Count(unsigned I) {
   unsigned Count = 1;
@@ -2285,6 +2326,12 @@ PreservedAnalyses ExplorativeLVPass::run(Function &F,
       MainPass->InferredInputs = nullptr;
     }
 
+    return PreservedAnalyses::all();
+  }
+
+  if (!Paths.findAll()) {
+    LLVM_DEBUG(dbgs() << "XLV: skipping " << F.getName()
+                      << " because of missing program paths\n");
     return PreservedAnalyses::all();
   }
 
