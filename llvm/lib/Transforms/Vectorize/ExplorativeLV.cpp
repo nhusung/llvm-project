@@ -188,12 +188,15 @@ struct Artifact {
 
   std::error_code create(const Twine &Prefix, StringRef Suffix,
                          sys::fs::OpenFlags Flags = sys::fs::OF_None) {
-    if (XLVArtifactsDir.empty())
-      return sys::fs::createTemporaryFile(Prefix, Suffix, Path, Flags);
-    const char *Middle = Suffix.empty() ? "" : ".";
-    (XLVArtifactsDir + sys::path::get_separator() + Prefix + Middle + Suffix)
-        .toStringRef(Path);
-    return std::error_code();
+    int FD;
+    auto EC = create(Prefix, Suffix, FD, Flags);
+    if (EC)
+      return EC;
+    // FD is only needed to avoid race conditions or to ensure that the file is
+    // truncated, respectively. Close it right away.
+    sys::fs::file_t F = sys::fs::convertFDToNativeFile(FD);
+    sys::fs::closeFile(F);
+    return EC;
   }
 };
 
