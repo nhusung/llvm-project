@@ -797,11 +797,14 @@ void LoopModuleBuilder::buildMainFuncBody(
   Type *I32Ty = Type::getInt32Ty(C);
   Type *I64Ty = Type::getInt64Ty(C);
   Type *ClockidTy = Type::getIntNTy(C, sizeof(clockid_t) * 8);
-  static_assert(sizeof(time_t) <= 8, "time_t larger than expected");
-  Type *TimeTy = Type::getIntNTy(C, sizeof(time_t) * 8);
-  static_assert(sizeof(long) <= 8, "long larger than expected");
-  Type *LongTy = Type::getIntNTy(C, sizeof(long) * 8);
-  Type *TimespecTy = StructType::create({TimeTy, LongTy}, "struct.timespec");
+  static_assert(sizeof(timespec::tv_sec) <= 8,
+                "timespec::tv_sec larger than expected");
+  Type *TimespecSecTy = Type::getIntNTy(C, sizeof(timespec::tv_sec) * 8);
+  static_assert(sizeof(timespec::tv_nsec) <= 8,
+                "timespec::tv_nsec larger than expected");
+  Type *TimespecNSecTy = Type::getIntNTy(C, sizeof(timespec::tv_nsec) * 8);
+  Type *TimespecTy =
+      StructType::create({TimespecSecTy, TimespecNSecTy}, "struct.timespec");
   Type *TimespecPtrTy = PointerType::get(TimespecTy, 0);
   Constant *Int0 = ConstantInt::get(IntTy, 0);
   Constant *Int1 = ConstantInt::get(IntTy, 1);
@@ -907,10 +910,10 @@ void LoopModuleBuilder::buildMainFuncBody(
 
     GetElementPtrInst *Ptr = GetElementPtrInst::CreateInBounds(
         TimespecTy, EndVar, {I640, TimespecSecIndex}, "te.sec_ptr", BB);
-    Value *EndSec = new LoadInst(TimeTy, Ptr, "te.sec", BB);
+    Value *EndSec = new LoadInst(TimespecSecTy, Ptr, "te.sec", BB);
     Ptr = GetElementPtrInst::CreateInBounds(
         TimespecTy, StartVar, {I640, TimespecSecIndex}, "ts.sec_ptr", BB);
-    Value *StartSec = new LoadInst(TimeTy, Ptr, "ts.sec", BB);
+    Value *StartSec = new LoadInst(TimespecSecTy, Ptr, "ts.sec", BB);
     Value *DiffSec = BinaryOperator::CreateSub(EndSec, StartSec, "td.sec", BB);
     if (sizeof(time_t) < 8)
       DiffSec = new ZExtInst(DiffSec, I64Ty, "td.sec64", BB);
@@ -918,14 +921,14 @@ void LoopModuleBuilder::buildMainFuncBody(
 
     Ptr = GetElementPtrInst::CreateInBounds(
         TimespecTy, EndVar, {I640, TimespecNSecIndex}, "te.nsec_ptr", BB);
-    Value *EndNSec = new LoadInst(LongTy, Ptr, "te.nsec", BB);
+    Value *EndNSec = new LoadInst(TimespecNSecTy, Ptr, "te.nsec", BB);
     if (sizeof(long) < 8)
       EndNSec = new ZExtInst(EndNSec, I64Ty, "te.nsec64", BB);
     DiffNSec = BinaryOperator::CreateAdd(DiffNSec, EndNSec, "", BB);
 
     Ptr = GetElementPtrInst::CreateInBounds(
         TimespecTy, StartVar, {I640, TimespecNSecIndex}, "ts.nsec_ptr", BB);
-    Value *StartNSec = new LoadInst(LongTy, Ptr, "ts.nsec", BB);
+    Value *StartNSec = new LoadInst(TimespecNSecTy, Ptr, "ts.nsec", BB);
     if (sizeof(long) < 8)
       StartNSec = new ZExtInst(EndNSec, I64Ty, "te.nsec64", BB);
     return BinaryOperator::CreateSub(DiffNSec, StartNSec, "td", BB);
