@@ -66,6 +66,7 @@
 #include "llvm/Transforms/Utils/LoopUtils.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
 #include <algorithm>
+#include <cstddef>
 #include <ctime>
 #include <random>
 #include <string>
@@ -136,6 +137,9 @@ static cl::opt<int> XLVBenchmarkPinCpu(
     "xlv-benchmark-pin-cpu", cl::Hidden, cl::init(-1),
     cl::desc("In benchmarking mode: pin the program to a specific core (using "
              "taskset, only works on Linux)"));
+static cl::opt<bool> XLVBenchmarkLikwid(
+    "xlv-benchmark-likwid", cl::Hidden, cl::init(false),
+    cl::desc("In benchmarking mode: generate markers for likwid-perfctr"));
 
 static cl::opt<bool>
     XLVRandomizeOrder("xlv-randomize-order", cl::Hidden, cl::init(false),
@@ -891,6 +895,49 @@ void LoopModuleBuilder::buildMainFuncBody(
   AllocaInst *CTStartVar = new AllocaInst(TimespecTy, 0, "ts", CStartBB);
   AllocaInst *CTEndVar = new AllocaInst(TimespecTy, 0, "te", CStartBB);
 
+  // Call int likwid_markerRegisterRegion(const char *regionTag)
+  Constant *LRegionTagPtr;
+  FunctionType *LMarkerFuncTy;
+  if (XLVBenchmarkLikwid) {
+    // Create the regionTag first:
+    // snprintf(regionTag, 64, "%u.%u.%u", VF, IF, UF);
+    const uint64_t NumElements = 64;
+    ArrayType *LRegionTagTy = ArrayType::get(Type::getInt8Ty(C), NumElements);
+    GlobalVariable *LRegionTagGV =
+        new GlobalVariable(*M, LRegionTagTy, false, GlobalValue::PrivateLinkage,
+                           Constant::getNullValue(LRegionTagTy), "regionTag");
+    LRegionTagPtr = ConstantExpr::getInBoundsGetElementPtr(
+        LRegionTagGV->getValueType(), LRegionTagGV,
+        ArrayRef<Constant *>{I640, I640});
+
+    Constant *FormatStr = ConstantDataArray::getString(C, "%u.%u.%u");
+    GlobalVariable *FormatStrGV = new GlobalVariable(
+        *M, FormatStr->getType(), true, GlobalValue::PrivateLinkage, FormatStr,
+        "regionTag_fstr");
+    Constant *FormatStrPtr = ConstantExpr::getInBoundsGetElementPtr(
+        FormatStrGV->getValueType(), FormatStrGV,
+        ArrayRef<Constant *>{I640, I640});
+
+    Type *SizeTy = Type::getIntNTy(C, sizeof(size_t) * 8);
+    FunctionType *SnprintfTy = FunctionType::get(
+        IntTy, {LRegionTagPtr->getType(), SizeTy, FormatStrPtr->getType()},
+        true);
+    CallInst::Create(SnprintfTy,
+                     Function::Create(SnprintfTy, GlobalValue::ExternalLinkage,
+                                      "snprintf", M),
+                     {LRegionTagPtr, ConstantInt::get(SizeTy, NumElements),
+                      FormatStrPtr, VFArg, IFArg, UFArg},
+                     "", StartBB);
+
+    // Register the region
+    LMarkerFuncTy = FunctionType::get(IntTy, {Type::getInt8PtrTy(C)}, false);
+    CallInst::Create(LMarkerFuncTy,
+                     Function::Create(LMarkerFuncTy,
+                                      GlobalValue::ExternalLinkage,
+                                      "likwid_markerRegisterRegion", M),
+                     {LRegionTagPtr}, "", StartBB);
+  }
+
   // Warmup
   for (unsigned I = 0; I < XLVBenchmarkWarmup; ++I) {
     CallInst::Create(LoopFuncTy, FuncArg, Args, "", StartBB);
@@ -902,6 +949,13 @@ void LoopModuleBuilder::buildMainFuncBody(
                    "", StartBB);
   CallInst::Create(ClockGettimeFuncTy, ClockGettimeFunc, {Clockid, CTStartVar},
                    "", CStartBB);
+  if (XLVBenchmarkLikwid) {
+    CallInst::Create(LMarkerFuncTy,
+                     Function::Create(LMarkerFuncTy,
+                                      GlobalValue::ExternalLinkage,
+                                      "likwid_markerStartRegion", M),
+                     {LRegionTagPtr}, "", StartBB);
+  }
 
   auto TimeDiff = [=](AllocaInst *StartVar, AllocaInst *EndVar,
                       BasicBlock *BB) {
@@ -972,6 +1026,13 @@ void LoopModuleBuilder::buildMainFuncBody(
   CCountPhi->addIncoming(CCountAdd, CLoopBB);
 
   // Stop measuring
+  if (XLVBenchmarkLikwid) {
+    CallInst::Create(LMarkerFuncTy,
+                     Function::Create(LMarkerFuncTy,
+                                      GlobalValue::ExternalLinkage,
+                                      "likwid_markerStopRegion", M),
+                     {LRegionTagPtr}, "", EvalBB);
+  }
   Value *TDiff = TimeDiff(TStartVar, TEndVar, EvalBB);
 
   // Create format strings
@@ -1005,6 +1066,20 @@ void LoopModuleBuilder::buildMainFuncBody(
                        GlobalValue::ExternalLinkage, 0, "main", M);
 
   BasicBlock *MainBB = BasicBlock::Create(C, "main", MainFunc);
+
+  FunctionType *VoidFuncTy;
+  if (XLVBenchmarkLikwid) {
+    VoidFuncTy = FunctionType::get(Type::getVoidTy(C), false);
+    CallInst::Create(VoidFuncTy,
+                     Function::Create(VoidFuncTy, GlobalValue::ExternalLinkage,
+                                      0, "likwid_markerInit", M),
+                     "", MainBB);
+    CallInst::Create(VoidFuncTy,
+                     Function::Create(VoidFuncTy, GlobalValue::ExternalLinkage,
+                                      0, "likwid_markerThreadInit", M),
+                     "", MainBB);
+  }
+
   CallInst *NRuns =
       CallInst::Create(CalibFuncTy, CalibFunc, {RefLoopFunc}, "n", MainBB);
   for (const ExplorativeLVPass::LoopFuncInfo &Info : LoopFuncs) {
@@ -1015,6 +1090,13 @@ void LoopModuleBuilder::buildMainFuncBody(
     Constant *UF = ConstantInt::get(IntTy, Info.UF);
     CallInst::Create(BenchFuncTy, BenchFunc, {Info.Func, NRuns, VF, IF, UF}, "",
                      MainBB);
+  }
+
+  if (XLVBenchmarkLikwid) {
+    CallInst::Create(VoidFuncTy,
+                     Function::Create(VoidFuncTy, GlobalValue::ExternalLinkage,
+                                      0, "likwid_markerClose", M),
+                     "", MainBB);
   }
 
   ReturnInst::Create(C, Int0, MainBB);
@@ -1620,14 +1702,16 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, unsigned LoopNo,
 
     SmallVector<StringRef, 5> CCOpts;
     CCOpts.push_back("cc");
+    CCOpts.push_back("-o");
+    CCOpts.push_back(Exec.Path);
+    CCOpts.push_back(Object.Path);
     if (!TM->isPositionIndependent())
       // Some systems appear to generate position independent executables by
       // default, but we do not necessarily generate position independent code
       // as well.
       CCOpts.push_back("-no-pie");
-    CCOpts.push_back("-o");
-    CCOpts.push_back(Exec.Path);
-    CCOpts.push_back(Object.Path);
+    if (XLVBenchmarkLikwid)
+      CCOpts.push_back("-llikwid");
 
     if (sys::ExecuteAndWait(Paths.cc(), CCOpts) != 0) {
       errs() << "XLV: linking failed\n";
