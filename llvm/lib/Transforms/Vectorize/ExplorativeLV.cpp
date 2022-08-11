@@ -53,6 +53,7 @@
 #include "llvm/IR/Value.h"
 #include "llvm/Passes/StandardInstrumentations.h"
 #include "llvm/Support/Casting.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/FileSystem.h"
@@ -111,6 +112,9 @@ static cl::opt<unsigned>
                    cl::desc("Limit the loop's code size (useful if an inner "
                             "loop was fully unrolled)"));
 
+static cl::opt<bool> XLVAllocStatic(
+    "xlv-alloc-static", cl::Hidden, cl::init(false),
+    cl::desc("In benchmarking mode: statically allocate memory"));
 static cl::opt<unsigned> XLVDesiredTripCount(
     "xlv-desired-tripcount", cl::Hidden, cl::init(1024),
     cl::desc("In benchmarking mode: try to run the loop with this trip count"));
@@ -248,8 +252,8 @@ public:
     return Desired;
   }
 
-  void build(Module &M, ArrayRef<Type *> Params,
-             SmallVectorImpl<Value *> &Args);
+  void build(Module &M, ArrayRef<Type *> Params, SmallVectorImpl<Value *> &Args,
+             BasicBlock *BB);
 
   void setNumInputArgs(unsigned Num) {
     assert(IntInputs.size() == 0 && MemAccesses.size() == 0 &&
@@ -301,14 +305,7 @@ void InputBuilder::addMemAccessWithEndptr(const Argument *ArgStart,
 }
 
 void InputBuilder::build(Module &M, ArrayRef<Type *> Params,
-                         SmallVectorImpl<Value *> &Args) {
-  for (MemAccessRange &Range : MemRanges) {
-    ArrayType *Ty =
-        ArrayType::get(Range.ElementType, Range.End + 1 - Range.Start);
-    Range.GV = new GlobalVariable(M, Ty, false, GlobalValue::PrivateLinkage,
-                                  ConstantAggregateZero::get(Ty));
-  }
-
+                         SmallVectorImpl<Value *> &Args, BasicBlock *BB) {
   Type *I64Ty = Type::getInt64Ty(M.getContext());
   Constant *I640 = ConstantInt::get(I64Ty, 0);
 
@@ -320,17 +317,49 @@ void InputBuilder::build(Module &M, ArrayRef<Type *> Params,
       auto &Access = MemAccesses[I].getValue();
       unsigned RangeID = Access.first;
       MemAccessRange &Range = MemRanges[RangeID];
-      GlobalVariable *GV = Range.GV;
       uint64_t Offset = Access.second - Range.Start;
+      uint64_t NumElements = Range.End + 1 - Range.Start;
+      if (XLVAllocStatic) {
+        ArrayType *Ty = ArrayType::get(Range.ElementType, NumElements);
+        if (!Range.GV) {
+          Range.GV =
+              new GlobalVariable(M, Ty, false, GlobalValue::PrivateLinkage,
+                                 ConstantAggregateZero::get(Ty));
+        }
 
-      ArgVal = ConstantExpr::getInBoundsGetElementPtr(
-          GV->getValueType(), GV,
-          ArrayRef<Constant *>{I640, ConstantInt::get(I64Ty, Offset)});
+        GlobalVariable *GV = Range.GV;
+        ArgVal = ConstantExpr::getInBoundsGetElementPtr(
+            GV->getValueType(), GV,
+            ArrayRef<Constant *>{I640, ConstantInt::get(I64Ty, Offset)});
+      } else { // Dynamic allocation
+        LLVMContext &C = M.getContext();
+        Type *SizeTy = Type::getIntNTy(C, sizeof(size_t) * 8);
+        FunctionType *CallocFuncTy =
+            FunctionType::get(Type::getInt8PtrTy(C), {SizeTy, SizeTy}, false);
+        Function *CallocFunc = M.getFunction("calloc");
+        if (!CallocFunc) {
+          CallocFunc = Function::Create(
+              CallocFuncTy, GlobalValue::ExternalLinkage, 0, "calloc", &M);
+        }
+        Value *Mem = CallInst::Create(
+            CallocFuncTy, CallocFunc,
+            {ConstantInt::get(SizeTy, NumElements),
+             ConstantInt::get(SizeTy, M.getDataLayout().getTypeAllocSize(
+                                          Range.ElementType))},
+            "arg" + Twine(I) + ".raw", BB);
+        ArgVal = new BitCastInst(Mem, PointerType::get(Range.ElementType, 0),
+                                 "arg" + Twine(I), BB);
+        if (Offset != 0) {
+          ArgVal = GetElementPtrInst::CreateInBounds(
+              Range.ElementType, ArgVal, {ConstantInt::get(I64Ty, Offset)},
+              "arg" + Twine(I) + ".offset", BB);
+        }
+        // Note that we do not generate a `free()`, we just leak the memory.
+      }
     } else { // Fall back to null values
       ArgVal = Constant::getNullValue(Params[I]);
     }
 
-    LLVM_DEBUG(dbgs() << "XLV: arg " << *ArgVal << '\n');
     Args.push_back(ArgVal);
   }
 }
@@ -851,214 +880,214 @@ void LoopModuleBuilder::buildMainFuncBody(
   Function *CalibFunc =
       Function::Create(CalibFuncTy, GlobalValue::ExternalLinkage, "calib", M);
 
-  Argument *FuncArg = BenchFunc->getArg(0);
-  FuncArg->setName("func");
-  Argument *NArg = BenchFunc->getArg(1);
-  NArg->setName("n");
-  Argument *VFArg = BenchFunc->getArg(2);
-  VFArg->setName("vf");
-  Argument *IFArg = BenchFunc->getArg(3);
-  IFArg->setName("if");
-  Argument *UFArg = BenchFunc->getArg(4);
-  UFArg->setName("uf");
-  Argument *CFuncArg = CalibFunc->getArg(0);
-  CFuncArg->setName("func");
+  auto BuildBenchCalib = [=](bool IsBench) {
+    LLVMContext &C = M->getContext();
 
-  BasicBlock *StartBB = BasicBlock::Create(C, "bench_start", BenchFunc);
-  BasicBlock *CStartBB = BasicBlock::Create(C, "calib_start", CalibFunc);
-
-  SmallVector<Value *> Args;
-  SmallVector<Value *> CArgs;
-  /* Create arguments */ {
-    unsigned NumParams = LoopFuncTy->getNumParams();
-    Args.reserve(NumParams);
-    CArgs.reserve(NumParams);
-
-    InferredInputs.build(*M, LoopFuncTy->params(), Args);
-    CArgs = Args;
-
-    // Allocate locations for output parameters
-    assert(Inputs.size() <= LoopFuncTy->getNumParams());
-    auto *It = LoopFuncTy->param_begin() + Inputs.size();
-    for (auto *End = LoopFuncTy->param_end(); It != End; ++It) {
-      Type *ElementType = (*It)->getNonOpaquePointerElementType();
-      Args.push_back(new AllocaInst(ElementType, BenchFunc->getAddressSpace(),
-                                    "outarg", StartBB));
-      CArgs.push_back(new AllocaInst(ElementType, CalibFunc->getAddressSpace(),
-                                     "outarg", CStartBB));
+    Function *Func;
+    Argument *NArg, *VFArg, *IFArg, *UFArg;
+    if (IsBench) {
+      Func = BenchFunc;
+      NArg = Func->getArg(1);
+      NArg->setName("n");
+      VFArg = Func->getArg(2);
+      VFArg->setName("vf");
+      IFArg = Func->getArg(3);
+      IFArg->setName("if");
+      UFArg = Func->getArg(4);
+      UFArg->setName("uf");
+    } else {
+      Func = CalibFunc;
     }
-  }
 
-  // Allocate timespec structs
-  AllocaInst *TStartVar = new AllocaInst(TimespecTy, 0, "ts", StartBB);
-  AllocaInst *TEndVar = new AllocaInst(TimespecTy, 0, "te", StartBB);
-  AllocaInst *CTStartVar = new AllocaInst(TimespecTy, 0, "ts", CStartBB);
-  AllocaInst *CTEndVar = new AllocaInst(TimespecTy, 0, "te", CStartBB);
+    Argument *FuncArg = Func->getArg(0);
+    FuncArg->setName("func");
 
-  // Call int likwid_markerRegisterRegion(const char *regionTag)
-  Constant *LRegionTagPtr;
-  FunctionType *LMarkerFuncTy;
-  if (XLVBenchmarkLikwid) {
-    // Create the regionTag first:
-    // snprintf(regionTag, 64, "%u.%u.%u", VF, IF, UF);
-    const uint64_t NumElements = 64;
-    ArrayType *LRegionTagTy = ArrayType::get(Type::getInt8Ty(C), NumElements);
-    GlobalVariable *LRegionTagGV =
-        new GlobalVariable(*M, LRegionTagTy, false, GlobalValue::PrivateLinkage,
-                           Constant::getNullValue(LRegionTagTy), "regionTag");
-    LRegionTagPtr = ConstantExpr::getInBoundsGetElementPtr(
-        LRegionTagGV->getValueType(), LRegionTagGV,
-        ArrayRef<Constant *>{I640, I640});
+    BasicBlock *StartBB = BasicBlock::Create(C, "start", Func);
+    SmallVector<Value *> Args;
+    /* Create arguments */ {
+      unsigned NumParams = LoopFuncTy->getNumParams();
+      Args.reserve(NumParams);
 
-    Constant *FormatStr = ConstantDataArray::getString(C, "%u.%u.%u");
-    GlobalVariable *FormatStrGV = new GlobalVariable(
-        *M, FormatStr->getType(), true, GlobalValue::PrivateLinkage, FormatStr,
-        "regionTag_fstr");
-    Constant *FormatStrPtr = ConstantExpr::getInBoundsGetElementPtr(
-        FormatStrGV->getValueType(), FormatStrGV,
-        ArrayRef<Constant *>{I640, I640});
+      InferredInputs.build(*M, LoopFuncTy->params(), Args, StartBB);
+      if (IsBench) {
+        for (Value *ArgVal : Args)
+          LLVM_DEBUG(dbgs() << "XLV: arg " << *ArgVal << '\n');
+      }
 
-    Type *SizeTy = Type::getIntNTy(C, sizeof(size_t) * 8);
-    FunctionType *SnprintfTy = FunctionType::get(
-        IntTy, {LRegionTagPtr->getType(), SizeTy, FormatStrPtr->getType()},
-        true);
-    CallInst::Create(SnprintfTy,
-                     Function::Create(SnprintfTy, GlobalValue::ExternalLinkage,
-                                      "snprintf", M),
-                     {LRegionTagPtr, ConstantInt::get(SizeTy, NumElements),
-                      FormatStrPtr, VFArg, IFArg, UFArg},
+      // Allocate locations for output parameters
+      assert(Inputs.size() <= LoopFuncTy->getNumParams());
+      auto *It = LoopFuncTy->param_begin() + Inputs.size();
+      for (auto *End = LoopFuncTy->param_end(); It != End; ++It) {
+        Type *ElementType = (*It)->getNonOpaquePointerElementType();
+        Args.push_back(new AllocaInst(ElementType, Func->getAddressSpace(),
+                                      "outarg", StartBB));
+      }
+    }
+
+    // Allocate timespec structs
+    AllocaInst *TStartVar = new AllocaInst(TimespecTy, 0, "ts", StartBB);
+    AllocaInst *TEndVar = new AllocaInst(TimespecTy, 0, "te", StartBB);
+
+    // Call int likwid_markerRegisterRegion(const char *regionTag)
+    Constant *LRegionTagPtr;
+    FunctionType *LMarkerFuncTy;
+    if (IsBench && XLVBenchmarkLikwid) {
+      // Create the regionTag first:
+      // snprintf(regionTag, 64, "%u.%u.%u", VF, IF, UF);
+      const uint64_t NumElements = 64;
+      ArrayType *LRegionTagTy = ArrayType::get(Type::getInt8Ty(C), NumElements);
+      GlobalVariable *LRegionTagGV = new GlobalVariable(
+          *M, LRegionTagTy, false, GlobalValue::PrivateLinkage,
+          Constant::getNullValue(LRegionTagTy), "regionTag");
+      LRegionTagPtr = ConstantExpr::getInBoundsGetElementPtr(
+          LRegionTagGV->getValueType(), LRegionTagGV,
+          ArrayRef<Constant *>{I640, I640});
+
+      Constant *FormatStr = ConstantDataArray::getString(C, "%u.%u.%u");
+      GlobalVariable *FormatStrGV = new GlobalVariable(
+          *M, FormatStr->getType(), true, GlobalValue::PrivateLinkage,
+          FormatStr, "regionTag_fstr");
+      Constant *FormatStrPtr = ConstantExpr::getInBoundsGetElementPtr(
+          FormatStrGV->getValueType(), FormatStrGV,
+          ArrayRef<Constant *>{I640, I640});
+
+      Type *SizeTy = Type::getIntNTy(C, sizeof(size_t) * 8);
+      FunctionType *SnprintfTy = FunctionType::get(
+          IntTy, {LRegionTagPtr->getType(), SizeTy, FormatStrPtr->getType()},
+          true);
+      CallInst::Create(SnprintfTy,
+                       Function::Create(SnprintfTy,
+                                        GlobalValue::ExternalLinkage,
+                                        "snprintf", M),
+                       {LRegionTagPtr, ConstantInt::get(SizeTy, NumElements),
+                        FormatStrPtr, VFArg, IFArg, UFArg},
+                       "", StartBB);
+
+      // Register the region
+      LMarkerFuncTy = FunctionType::get(IntTy, {Type::getInt8PtrTy(C)}, false);
+      CallInst::Create(LMarkerFuncTy,
+                       Function::Create(LMarkerFuncTy,
+                                        GlobalValue::ExternalLinkage,
+                                        "likwid_markerRegisterRegion", M),
+                       {LRegionTagPtr}, "", StartBB);
+    }
+
+    // Warmup
+    for (unsigned I = 0; I < XLVBenchmarkWarmup; ++I) {
+      CallInst::Create(LoopFuncTy, FuncArg, Args, "", StartBB);
+    }
+
+    // Start measuring
+    CallInst::Create(ClockGettimeFuncTy, ClockGettimeFunc, {Clockid, TStartVar},
                      "", StartBB);
+    if (IsBench && XLVBenchmarkLikwid) {
+      CallInst::Create(LMarkerFuncTy,
+                       Function::Create(LMarkerFuncTy,
+                                        GlobalValue::ExternalLinkage,
+                                        "likwid_markerStartRegion", M),
+                       {LRegionTagPtr}, "", StartBB);
+    }
 
-    // Register the region
-    LMarkerFuncTy = FunctionType::get(IntTy, {Type::getInt8PtrTy(C)}, false);
-    CallInst::Create(LMarkerFuncTy,
-                     Function::Create(LMarkerFuncTy,
-                                      GlobalValue::ExternalLinkage,
-                                      "likwid_markerRegisterRegion", M),
-                     {LRegionTagPtr}, "", StartBB);
-  }
+    auto TimeDiff = [=](BasicBlock *BB) {
+      CallInst::Create(ClockGettimeFuncTy, ClockGettimeFunc, {Clockid, TEndVar},
+                       "", BB);
 
-  // Warmup
-  for (unsigned I = 0; I < XLVBenchmarkWarmup; ++I) {
-    CallInst::Create(LoopFuncTy, FuncArg, Args, "", StartBB);
-    CallInst::Create(LoopFuncTy, CFuncArg, CArgs, "", CStartBB);
-  }
+      GetElementPtrInst *Ptr = GetElementPtrInst::CreateInBounds(
+          TimespecTy, TEndVar, {I640, TimespecSecIndex}, "te.sec_ptr", BB);
+      Value *EndSec = new LoadInst(TimespecSecTy, Ptr, "te.sec", BB);
+      Ptr = GetElementPtrInst::CreateInBounds(
+          TimespecTy, TStartVar, {I640, TimespecSecIndex}, "ts.sec_ptr", BB);
+      Value *StartSec = new LoadInst(TimespecSecTy, Ptr, "ts.sec", BB);
+      Value *DiffSec =
+          BinaryOperator::CreateSub(EndSec, StartSec, "td.sec", BB);
+      if (sizeof(time_t) < 8)
+        DiffSec = new ZExtInst(DiffSec, I64Ty, "td.sec64", BB);
+      Value *DiffNSec = BinaryOperator::CreateMul(DiffSec, Nanos, "", BB);
 
-  // Start measuring
-  CallInst::Create(ClockGettimeFuncTy, ClockGettimeFunc, {Clockid, TStartVar},
-                   "", StartBB);
-  CallInst::Create(ClockGettimeFuncTy, ClockGettimeFunc, {Clockid, CTStartVar},
-                   "", CStartBB);
-  if (XLVBenchmarkLikwid) {
-    CallInst::Create(LMarkerFuncTy,
-                     Function::Create(LMarkerFuncTy,
-                                      GlobalValue::ExternalLinkage,
-                                      "likwid_markerStartRegion", M),
-                     {LRegionTagPtr}, "", StartBB);
-  }
+      Ptr = GetElementPtrInst::CreateInBounds(
+          TimespecTy, TEndVar, {I640, TimespecNSecIndex}, "te.nsec_ptr", BB);
+      Value *EndNSec = new LoadInst(TimespecNSecTy, Ptr, "te.nsec", BB);
+      if (sizeof(long) < 8)
+        EndNSec = new ZExtInst(EndNSec, I64Ty, "te.nsec64", BB);
+      DiffNSec = BinaryOperator::CreateAdd(DiffNSec, EndNSec, "", BB);
 
-  auto TimeDiff = [=](AllocaInst *StartVar, AllocaInst *EndVar,
-                      BasicBlock *BB) {
-    CallInst::Create(ClockGettimeFuncTy, ClockGettimeFunc, {Clockid, EndVar},
-                     "", BB);
+      Ptr = GetElementPtrInst::CreateInBounds(
+          TimespecTy, TStartVar, {I640, TimespecNSecIndex}, "ts.nsec_ptr", BB);
+      Value *StartNSec = new LoadInst(TimespecNSecTy, Ptr, "ts.nsec", BB);
+      if (sizeof(long) < 8)
+        StartNSec = new ZExtInst(EndNSec, I64Ty, "te.nsec64", BB);
+      return BinaryOperator::CreateSub(DiffNSec, StartNSec, "td", BB);
+    };
 
-    GetElementPtrInst *Ptr = GetElementPtrInst::CreateInBounds(
-        TimespecTy, EndVar, {I640, TimespecSecIndex}, "te.sec_ptr", BB);
-    Value *EndSec = new LoadInst(TimespecSecTy, Ptr, "te.sec", BB);
-    Ptr = GetElementPtrInst::CreateInBounds(
-        TimespecTy, StartVar, {I640, TimespecSecIndex}, "ts.sec_ptr", BB);
-    Value *StartSec = new LoadInst(TimespecSecTy, Ptr, "ts.sec", BB);
-    Value *DiffSec = BinaryOperator::CreateSub(EndSec, StartSec, "td.sec", BB);
-    if (sizeof(time_t) < 8)
-      DiffSec = new ZExtInst(DiffSec, I64Ty, "td.sec64", BB);
-    Value *DiffNSec = BinaryOperator::CreateMul(DiffSec, Nanos, "", BB);
+    // Benchmarking loop
+    BasicBlock *LoopBB = BasicBlock::Create(C, "loop", Func);
+    BranchInst::Create(LoopBB, StartBB);
+    PHINode *CountPhi = PHINode::Create(IntTy, 2, "counter", LoopBB);
+    CountPhi->addIncoming(Int1, StartBB);
 
-    Ptr = GetElementPtrInst::CreateInBounds(
-        TimespecTy, EndVar, {I640, TimespecNSecIndex}, "te.nsec_ptr", BB);
-    Value *EndNSec = new LoadInst(TimespecNSecTy, Ptr, "te.nsec", BB);
-    if (sizeof(long) < 8)
-      EndNSec = new ZExtInst(EndNSec, I64Ty, "te.nsec64", BB);
-    DiffNSec = BinaryOperator::CreateAdd(DiffNSec, EndNSec, "", BB);
+    for (unsigned I = 0; I < XLVBenchmarkLoopSize; ++I) {
+      CallInst::Create(LoopFuncTy, FuncArg, Args, "", LoopBB);
+    }
 
-    Ptr = GetElementPtrInst::CreateInBounds(
-        TimespecTy, StartVar, {I640, TimespecNSecIndex}, "ts.nsec_ptr", BB);
-    Value *StartNSec = new LoadInst(TimespecNSecTy, Ptr, "ts.nsec", BB);
-    if (sizeof(long) < 8)
-      StartNSec = new ZExtInst(EndNSec, I64Ty, "te.nsec64", BB);
-    return BinaryOperator::CreateSub(DiffNSec, StartNSec, "td", BB);
+    // Counters and exit conditions
+    ICmpInst *ContLoop;
+    Value *TDiff;
+    if (IsBench) {
+      ContLoop = new ICmpInst(*LoopBB, CmpInst::ICMP_EQ, CountPhi, NArg);
+    } else {
+      TDiff = TimeDiff(LoopBB);
+      ContLoop =
+          new ICmpInst(*LoopBB, CmpInst::ICMP_UGT, TDiff,
+                       ConstantInt::get(I64Ty, 1000 * XLVBenchmarkUSecs));
+    }
+    BinaryOperator *CountAdd =
+        BinaryOperator::CreateAdd(CountPhi, Int1, "counter_next", LoopBB);
+
+    // Branch at the end of the loop
+    BasicBlock *EvalBB = BasicBlock::Create(C, "eval", Func);
+    BranchInst::Create(EvalBB, LoopBB, ContLoop, LoopBB);
+    CountPhi->addIncoming(CountAdd, LoopBB);
+
+    // Stop measuring
+    if (IsBench) {
+      if (XLVBenchmarkLikwid) {
+        CallInst::Create(LMarkerFuncTy,
+                         Function::Create(LMarkerFuncTy,
+                                          GlobalValue::ExternalLinkage,
+                                          "likwid_markerStopRegion", M),
+                         {LRegionTagPtr}, "", EvalBB);
+      }
+      TDiff = TimeDiff(EvalBB);
+
+      // `printf(fstr, vf, if, uf, dt); return;`
+      Constant *FormatStr = ConstantDataArray::getString(C, "%u %u %u %llu\n");
+      GlobalVariable *FormatStrGV =
+          new GlobalVariable(*M, FormatStr->getType(), true,
+                             GlobalValue::PrivateLinkage, FormatStr, "fstr");
+      Constant *FormatStrPtr = ConstantExpr::getInBoundsGetElementPtr(
+          FormatStrGV->getValueType(), FormatStrGV,
+          ArrayRef<Constant *>{I640, I640});
+
+      CallInst::Create(PrintfFuncTy, PrintfFunc,
+                       {FormatStrPtr, VFArg, IFArg, UFArg, TDiff}, "", EvalBB);
+      ReturnInst::Create(C, EvalBB);
+    } else {
+      // `printf(fstr, dt, n); return n;`
+      Constant *FormatStr = ConstantDataArray::getString(C, "%llu %u\n");
+      GlobalVariable *FormatStrGV =
+          new GlobalVariable(*M, FormatStr->getType(), true,
+                             GlobalValue::PrivateLinkage, FormatStr, "cfstr");
+      Constant *FormatStrPtr = ConstantExpr::getInBoundsGetElementPtr(
+          FormatStrGV->getValueType(), FormatStrGV,
+          ArrayRef<Constant *>{I640, I640});
+
+      CallInst::Create(PrintfFuncTy, PrintfFunc,
+                       {FormatStrPtr, TDiff, CountPhi}, "", EvalBB);
+      ReturnInst::Create(C, CountPhi, EvalBB);
+    }
   };
-
-  // Benchmarking loop
-  BasicBlock *LoopBB = BasicBlock::Create(C, "bench_loop", BenchFunc);
-  BranchInst::Create(LoopBB, StartBB);
-  PHINode *CountPhi = PHINode::Create(IntTy, 2, "counter", LoopBB);
-  CountPhi->addIncoming(Int1, StartBB);
-
-  BasicBlock *CLoopBB = BasicBlock::Create(C, "calib_loop", CalibFunc);
-  BranchInst::Create(CLoopBB, CStartBB);
-  PHINode *CCountPhi = PHINode::Create(IntTy, 2, "counter", CLoopBB);
-  CCountPhi->addIncoming(Int1, CStartBB);
-
-  for (unsigned I = 0; I < XLVBenchmarkLoopSize; ++I) {
-    CallInst::Create(LoopFuncTy, FuncArg, Args, "", LoopBB);
-    CallInst::Create(LoopFuncTy, CFuncArg, CArgs, "", CLoopBB);
-  }
-
-  // Counters and exit conditions
-  ICmpInst *ContLoop = new ICmpInst(*LoopBB, CmpInst::ICMP_EQ, CountPhi, NArg);
-  BinaryOperator *CountAdd =
-      BinaryOperator::CreateAdd(CountPhi, Int1, "counter_next", LoopBB);
-
-  Value *CTDiff = TimeDiff(CTStartVar, CTEndVar, CLoopBB);
-  ICmpInst *CContLoop =
-      new ICmpInst(*CLoopBB, CmpInst::ICMP_ULT, CTDiff,
-                   ConstantInt::get(I64Ty, 1000 * XLVBenchmarkUSecs));
-  BinaryOperator *CCountAdd =
-      BinaryOperator::CreateAdd(CCountPhi, Int1, "counter_next", CLoopBB);
-
-  // Branch at the end of the loop
-  BasicBlock *EvalBB = BasicBlock::Create(C, "bench_eval", BenchFunc);
-  BranchInst::Create(EvalBB, LoopBB, ContLoop, LoopBB);
-  CountPhi->addIncoming(CountAdd, LoopBB);
-
-  BasicBlock *CEvalBB = BasicBlock::Create(C, "calib_ret", CalibFunc);
-  BranchInst::Create(CLoopBB, CEvalBB, CContLoop, CLoopBB);
-  CCountPhi->addIncoming(CCountAdd, CLoopBB);
-
-  // Stop measuring
-  if (XLVBenchmarkLikwid) {
-    CallInst::Create(LMarkerFuncTy,
-                     Function::Create(LMarkerFuncTy,
-                                      GlobalValue::ExternalLinkage,
-                                      "likwid_markerStopRegion", M),
-                     {LRegionTagPtr}, "", EvalBB);
-  }
-  Value *TDiff = TimeDiff(TStartVar, TEndVar, EvalBB);
-
-  // Create format strings
-  Constant *FormatStr = ConstantDataArray::getString(C, "%u %u %u %llu\n");
-  Constant *CFormatStr = ConstantDataArray::getString(C, "%llu %u\n");
-  GlobalVariable *FormatStrGV =
-      new GlobalVariable(*M, FormatStr->getType(), true,
-                         GlobalValue::PrivateLinkage, FormatStr, "fstr");
-  GlobalVariable *CFormatStrGV =
-      new GlobalVariable(*M, CFormatStr->getType(), true,
-                         GlobalValue::PrivateLinkage, CFormatStr, "cfstr");
-  Constant *FormatStrPtr = ConstantExpr::getInBoundsGetElementPtr(
-      FormatStrGV->getValueType(), FormatStrGV,
-      ArrayRef<Constant *>{I640, I640});
-  Constant *CFormatStrPtr = ConstantExpr::getInBoundsGetElementPtr(
-      CFormatStrGV->getValueType(), CFormatStrGV,
-      ArrayRef<Constant *>{I640, I640});
-
-  // `printf(fstr, vf, if, uf, dt); return;` / `printf(fstr, dt, n); return;`
-  CallInst::Create(PrintfFuncTy, PrintfFunc,
-                   {FormatStrPtr, VFArg, IFArg, UFArg, TDiff}, "", EvalBB);
-  ReturnInst::Create(C, EvalBB);
-
-  CallInst::Create(PrintfFuncTy, PrintfFunc, {CFormatStrPtr, CTDiff, CCountPhi},
-                   "", CEvalBB);
-  ReturnInst::Create(C, CCountPhi, CEvalBB);
+  BuildBenchCalib(false);
+  BuildBenchCalib(true);
 
   // Declare & define `int main(void)`
   Function *MainFunc =
