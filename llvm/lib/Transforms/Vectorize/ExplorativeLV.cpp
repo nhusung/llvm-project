@@ -137,8 +137,8 @@ static cl::opt<unsigned>
     XLVBenchmarkLoopSize("xlv-benchmark-loop-size", cl::Hidden, cl::init(32),
                          cl::desc("In benchmarking mode: size (loop "
                                   "function calls) of the benchmark loop"));
-static cl::opt<int> XLVBenchmarkPinCpu(
-    "xlv-benchmark-pin-cpu", cl::Hidden, cl::init(-1),
+static cl::opt<std::string> XLVBenchmarkPinCpu(
+    "xlv-benchmark-pin-cpu", cl::Hidden, cl::init(""),
     cl::desc("In benchmarking mode: pin the program to a specific core (using "
              "taskset, only works on Linux)"));
 static cl::opt<bool> XLVBenchmarkLikwid(
@@ -1767,16 +1767,13 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, unsigned LoopNo,
       return true;
     }
     int RetCode;
-    if (XLVBenchmarkPinCpu < 0) {
+    if (XLVBenchmarkPinCpu.empty()) {
       RetCode = sys::ExecuteAndWait(
           Exec.Path, {"explorative-lv"}, None,
           {StringRef(""), BenchResFile.Path.str(), StringRef("")}, TimeoutS);
     } else {
-      SmallString<11> CpuId;
       RetCode = sys::ExecuteAndWait(
-          Paths.taskset(),
-          {"taskset", "-c", Twine(XLVBenchmarkPinCpu).toStringRef(CpuId),
-           Exec.Path},
+          Paths.taskset(), {"taskset", "-c", XLVBenchmarkPinCpu, Exec.Path},
           None, {StringRef(""), BenchResFile.Path.str(), StringRef("")},
           TimeoutS);
     }
@@ -2383,7 +2380,7 @@ bool ExplorativeLVPass::ProgramPaths::findAll() {
     }
     CC = CCPath.get();
 
-    if (XLVBenchmarkPinCpu >= 0) {
+    if (!XLVBenchmarkPinCpu.empty()) {
       auto TasksetPath = sys::findProgramByName("taskset");
       if (!TasksetPath) {
         errs() << "XLV: could not find taskset executable\n";
