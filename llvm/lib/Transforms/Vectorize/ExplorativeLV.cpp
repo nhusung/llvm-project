@@ -1218,6 +1218,7 @@ static void filterOutUnvectorized(
     Function &F = *Info.Func;
     Function::BasicBlockListType &BBs = F.getBasicBlockList();
 
+    // FIXME: We should rather check whether a loop exists.
     if (BBs.size() > 1) {
       BasicBlock *Latch;
       if (Info.VF == 1 && Info.IF == 1) {
@@ -1239,11 +1240,13 @@ static void filterOutUnvectorized(
       // been fully unrolled.  In this case, we won't find any llvm.loop
       // metadata.  To find out whether vectorization actually took place, we
       // look at the instructions types instead.
-      // It is not really clear what happens if VF == 1 but IF > 1.  In one
-      // example the vectorizer produced instructions with vector type, but is
-      // this always the case?  That is why we do not filter such functions out
-      // here.  This just increases compile time a little, for the evaluation it
-      // is not a problem since we know how much "work" was done.
+      // Here, we can only filter out loops with VF > 1.  If the SLP vectorizer
+      // is enabled and IF > 1, the duplicated instructions from the
+      // interleaving are typically merged into vector instructions, but we do
+      // not want to rely on this.  This means that we do not filter out any
+      // loops with VF = 1 and IF > 1, which possibly increases compile time a
+      // little.  For the evaluation it is not a problem since we know how much
+      // "work" was done.
       Info.FullUnroll = true;
 
       BasicBlock &BB = BBs.front();
