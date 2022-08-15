@@ -108,7 +108,7 @@ static cl::opt<unsigned> XLVMaxFullUnroll(
     cl::desc("If the loop's trip count is known and below this threshold, "
              "explore the fully unrolled loop as well"));
 static cl::opt<unsigned>
-    XLVMaxCodeSize("xlv-max-code-size", cl::Hidden, cl::init(512),
+    XLVMaxCodeSize("xlv-max-code-size", cl::Hidden, cl::init(1024),
                    cl::desc("Limit the loop's code size (useful if an inner "
                             "loop was fully unrolled)"));
 
@@ -130,11 +130,11 @@ static cl::opt<XLVClockid> XLVBenchmarkClockid(
                clEnumValN(XLVClockid::PROCESS_CPUTIME_ID, "process",
                           "CLOCK_PROCESS_CPUTIME_ID")));
 static cl::opt<unsigned> XLVBenchmarkWarmup(
-    "xlv-benchmark-warmup", cl::Hidden, cl::init(16),
+    "xlv-benchmark-warmup", cl::Hidden, cl::init(2),
     cl::desc("In benchmarking mode: how many times to call each loop function "
              "before benchmarking"));
 static cl::opt<unsigned>
-    XLVBenchmarkLoopSize("xlv-benchmark-loop-size", cl::Hidden, cl::init(32),
+    XLVBenchmarkLoopSize("xlv-benchmark-loop-size", cl::Hidden, cl::init(1),
                          cl::desc("In benchmarking mode: size (loop "
                                   "function calls) of the benchmark loop"));
 static cl::opt<std::string> XLVBenchmarkPinCpu(
