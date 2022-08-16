@@ -87,7 +87,6 @@ private:
     return It == LoopFuncInfoMap.end() ? nullptr : &LoopFuncInfos[It->second];
   }
 
-  struct CostAccumulator;
   struct CSVOutputContainer;
   CSVOutputContainer *CSVOutput = nullptr;
 
