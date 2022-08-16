@@ -1218,16 +1218,10 @@ static void filterOutUnvectorized(
     Function &F = *Info.Func;
     Function::BasicBlockListType &BBs = F.getBasicBlockList();
 
-    // FIXME: We should rather check whether a loop exists.
-    if (BBs.size() > 1) {
-      BasicBlock *Latch;
-      if (Info.VF == 1 && Info.IF == 1) {
-        if (!AddMCAAnnotations)
-          continue;
-        Latch = findSomeLatch(F);
-      } else {
+    BasicBlock *Latch = findSomeLatch(F);
+    if (Latch) {
+      if (Info.VF > 1 || Info.IF > 1)
         Latch = findLatchOfVectorizedLoop(F);
-      }
       if (Latch) {
         if (AddMCAAnnotations)
           addMCAAnnotation(F.getContext(), getMCAStart(F, *Latch), *Latch,
@@ -1235,11 +1229,9 @@ static void filterOutUnvectorized(
         continue;
       }
     } else {
-      assert(BBs.size() == 1);
-      // If there is only a single BasicBlock, this indicates that the loop has
-      // been fully unrolled.  In this case, we won't find any llvm.loop
-      // metadata.  To find out whether vectorization actually took place, we
-      // look at the instructions types instead.
+      // In this case the loop has (probably) been fully unrolled.  To find out
+      // whether vectorization actually took place, we can only look at the
+      // instruction types.
       // Here, we can only filter out loops with VF > 1.  If the SLP vectorizer
       // is enabled and IF > 1, the duplicated instructions from the
       // interleaving are typically merged into vector instructions, but we do
@@ -1249,19 +1241,21 @@ static void filterOutUnvectorized(
       // "work" was done.
       Info.FullUnroll = true;
 
-      BasicBlock &BB = BBs.front();
       if (Info.VF == 1) {
         if (AddMCAAnnotations)
-          addMCAAnnotation(F.getContext(), BB, BB, Twine(I));
+          addMCAAnnotation(F.getContext(), BBs.front(), BBs.back(), Twine(I));
         continue;
       }
 
       // Check that there is at least one instruction having vector type
-      for (Instruction &Inst : BB) {
-        if (Inst.getType()->isVectorTy()) {
-          if (AddMCAAnnotations)
-            addMCAAnnotation(F.getContext(), BB, BB, Twine(I));
-          continue;
+      for (BasicBlock &BB : F.getBasicBlockList()) {
+        for (Instruction &Inst : BB) {
+          if (Inst.getType()->isVectorTy()) {
+            if (AddMCAAnnotations)
+              addMCAAnnotation(F.getContext(), BBs.front(), BBs.back(),
+                               Twine(I));
+            break;
+          }
         }
       }
     }
