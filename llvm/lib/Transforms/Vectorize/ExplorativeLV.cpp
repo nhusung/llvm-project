@@ -1264,7 +1264,7 @@ static void filterOutUnvectorized(
             if (AddMCAAnnotations)
               addMCAAnnotation(F.getContext(), BBs.front(), BBs.back(),
                                Twine(I));
-            break;
+            goto found;
           }
         }
       }
@@ -1274,6 +1274,8 @@ static void filterOutUnvectorized(
                       << Info.IF << ", UF " << Info.UF << '\n');
     F.eraseFromParent();
     Info.Func = nullptr;
+
+  found:;
   }
 }
 
