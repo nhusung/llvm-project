@@ -1218,6 +1218,16 @@ static BasicBlock &getMCAStart(Function &F, BasicBlock &Latch) {
   return *First;
 }
 
+static bool containsVectorInstruction(Function::BasicBlockListType &BBs) {
+  for (BasicBlock &BB : BBs) {
+    for (Instruction &Inst : BB) {
+      if (Inst.getType()->isVectorTy())
+        return true;
+    }
+  }
+  return false;
+}
+
 static void filterOutUnvectorized(
     SmallVectorImpl<ExplorativeLVPass::LoopFuncInfo> &LoopFuncs,
     bool AddMCAAnnotations) {
@@ -1232,7 +1242,7 @@ static void filterOutUnvectorized(
     if (Latch) {
       if (Info.VF > 1 || Info.IF > 1)
         Latch = findLatchOfVectorizedLoop(F);
-      if (Latch) {
+      if (Latch && (Info.VF == 1 || containsVectorInstruction(BBs))) {
         if (AddMCAAnnotations)
           addMCAAnnotation(F.getContext(), getMCAStart(F, *Latch), *Latch,
                            Twine(I));
@@ -1251,22 +1261,10 @@ static void filterOutUnvectorized(
       // "work" was done.
       Info.FullUnroll = true;
 
-      if (Info.VF == 1) {
+      if (Info.VF == 1 || containsVectorInstruction(BBs)) {
         if (AddMCAAnnotations)
           addMCAAnnotation(F.getContext(), BBs.front(), BBs.back(), Twine(I));
         continue;
-      }
-
-      // Check that there is at least one instruction having vector type
-      for (BasicBlock &BB : F.getBasicBlockList()) {
-        for (Instruction &Inst : BB) {
-          if (Inst.getType()->isVectorTy()) {
-            if (AddMCAAnnotations)
-              addMCAAnnotation(F.getContext(), BBs.front(), BBs.back(),
-                               Twine(I));
-            goto found;
-          }
-        }
       }
     }
 
@@ -1274,8 +1272,6 @@ static void filterOutUnvectorized(
                       << Info.IF << ", UF " << Info.UF << '\n');
     F.eraseFromParent();
     Info.Func = nullptr;
-
-  found:;
   }
 }
 
