@@ -109,7 +109,7 @@ static cl::opt<unsigned> XLVMaxFullUnroll(
     cl::desc("If the loop's trip count is known and below this threshold, "
              "explore the fully unrolled loop as well"));
 static cl::opt<unsigned>
-    XLVMaxCodeSize("xlv-max-code-size", cl::Hidden, cl::init(1024),
+    XLVMaxCodeSize("xlv-max-code-size", cl::Hidden, cl::init(0),
                    cl::desc("Limit the loop's code size (useful if an inner "
                             "loop was fully unrolled)"));
 
@@ -1551,7 +1551,7 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, unsigned LoopNo,
         continue;
       LoopSize *= FullUnroll;
     }
-    if (LoopSize > XLVMaxCodeSize) {
+    if (XLVMaxCodeSize > 0 && LoopSize > XLVMaxCodeSize) {
       LLVM_DEBUG(dbgs() << "XLV: not exploring VF " << Info.VF << ", IF "
                         << Info.IF << ", UF " << Info.UF
                         << " because of code size " << LoopSize << " > "
