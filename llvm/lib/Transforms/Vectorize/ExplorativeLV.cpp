@@ -1536,7 +1536,7 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, unsigned LoopNo,
   if (!M)
     return true;
 
-  assert(LoopFuncInfoMap.size() == 0);
+  assert(LoopFuncInfoMap.empty());
 
   for (unsigned I = 0, E = LoopFuncInfos.size(); I < E; ++I) {
     LoopFuncInfo &Info = LoopFuncInfos[I];
@@ -1562,6 +1562,9 @@ bool ExplorativeLVPass::processLoop(Function &F, Loop &L, unsigned LoopNo,
     // Info.FullUnroll is set in filterOutUnvectorized()
     LoopFuncInfoMap.try_emplace(Info.Func, I);
   }
+
+  if (LoopFuncInfoMap.empty())
+    return true; // There are no functions to explore
 
   // Get a reference to the InputBuilder.  The ExplorativeLVPass in the
   // optimization pipeline will (try to) infer the arguments.
