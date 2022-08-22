@@ -1972,6 +1972,21 @@ class SCEVBackedgeTakenAnalyzer
   SCEVBackedgeTakenAnalyzer(ScalarEvolution &SE, InputBuilder &InferredInputs)
       : SE(SE), Inferred(InferredInputs) {}
 
+  bool isMulNeg(const SCEV *Expr) {
+    const SCEVMulExpr *Mul = dyn_cast<SCEVMulExpr>(Expr);
+    if (Mul == nullptr)
+      return false;
+
+    uint64_t Bits = SE.getTypeSizeInBits(Mul->getType());
+    APInt Res(Bits, 1);
+
+    for (const SCEV *Sub : Mul->operands()) {
+      if (const SCEVConstant *Const = dyn_cast<SCEVConstant>(Sub))
+        Res *= Const->getAPInt();
+    }
+    return Res.isNegative();
+  }
+
   Optional<APInt> visitConstant(const SCEVConstant *Constant, APInt) {
     return Constant->getAPInt();
   }
@@ -2015,21 +2030,33 @@ class SCEVBackedgeTakenAnalyzer
 
   Optional<APInt> visitAddExpr(const SCEVAddExpr *Expr, APInt Desired) {
     APInt Res(SE.getTypeSizeInBits(Expr->getType()), 0);
+    SmallVector<const SCEV *, 8> SubNormal;
+    SmallVector<const SCEV *, 8> SubNeg;
 
     // Handle constant operands first
     for (const SCEV *Sub : Expr->operands()) {
-      if (const SCEVConstant *Const = dyn_cast<SCEVConstant>(Sub))
+      if (const SCEVConstant *Const = dyn_cast<SCEVConstant>(Sub)) {
         Res += Const->getAPInt();
+      } else if (isMulNeg(Sub)) {
+        SubNeg.push_back(Sub);
+      } else {
+        SubNormal.push_back(Sub);
+      }
     }
-    Desired -= Res;
 
-    for (const SCEV *Sub : Expr->operands()) {
-      if (isa<SCEVConstant>(Sub))
-        continue;
-
+    APInt DesiredNormal = Desired - Res;
+    for (const SCEV *Sub : SubNormal) {
       // We hope that there is just one unknown in a "positive" position.
       // Otherwise we end up with more iterations than desired, but this should
       // not be too bad either.
+      Optional<APInt> SubRes = visit(Sub, Desired);
+      if (!SubRes)
+        return None;
+      Res += *SubRes;
+    }
+    Desired -= Res;
+
+    for (const SCEV *Sub : SubNeg) {
       Optional<APInt> SubRes = visit(Sub, Desired);
       if (!SubRes)
         return None;
