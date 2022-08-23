@@ -2049,7 +2049,7 @@ class SCEVBackedgeTakenAnalyzer
       // We hope that there is just one unknown in a "positive" position.
       // Otherwise we end up with more iterations than desired, but this should
       // not be too bad either.
-      Optional<APInt> SubRes = visit(Sub, Desired);
+      Optional<APInt> SubRes = visit(Sub, DesiredNormal);
       if (!SubRes)
         return None;
       Res += *SubRes;
