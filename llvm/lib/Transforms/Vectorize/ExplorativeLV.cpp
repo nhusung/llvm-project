@@ -2029,7 +2029,8 @@ class SCEVBackedgeTakenAnalyzer
   }
 
   Optional<APInt> visitAddExpr(const SCEVAddExpr *Expr, APInt Desired) {
-    APInt Res(SE.getTypeSizeInBits(Expr->getType()), 0);
+    uint64_t Bits = SE.getTypeSizeInBits(Expr->getType());
+    APInt Res(Bits, 0);
     SmallVector<const SCEV *, 8> SubNormal;
     SmallVector<const SCEV *, 8> SubNeg;
 
@@ -2043,21 +2044,20 @@ class SCEVBackedgeTakenAnalyzer
         SubNormal.push_back(Sub);
       }
     }
+    Desired -= Res;
 
-    APInt DesiredNormal = Desired - Res;
     for (const SCEV *Sub : SubNormal) {
       // We hope that there is just one unknown in a "positive" position.
       // Otherwise we end up with more iterations than desired, but this should
       // not be too bad either.
-      Optional<APInt> SubRes = visit(Sub, DesiredNormal);
+      Optional<APInt> SubRes = visit(Sub, Desired);
       if (!SubRes)
         return None;
       Res += *SubRes;
     }
-    Desired -= Res;
 
     for (const SCEV *Sub : SubNeg) {
-      Optional<APInt> SubRes = visit(Sub, Desired);
+      Optional<APInt> SubRes = visit(Sub, APInt(Bits, 0));
       if (!SubRes)
         return None;
       Res += *SubRes;
