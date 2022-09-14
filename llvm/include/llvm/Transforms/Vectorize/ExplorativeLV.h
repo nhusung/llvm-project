@@ -6,17 +6,24 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// This pass is inserted in the middle end pipeline immediately before the
-// loop vectorizer. When enabled, it retrieves the innermost loops of the
-// function like it is done for vectorization.
-// Each loop is copied into a plain function in a new module; for each
-// vectorization and interleaving factor within range (range can be adapted in
-// lines 659,660) the loop is annotated with pragmas to force the LV to choose
-// this VF and IF. Then it is sent through the compilation pipeline, stopping
-// at assembly file generation where MachineCodeExplorer.cpp computes a cost
-// estimate based on the machine code.
-// The VF-IF combination with the lowest cost is selected and forced onto the
-// LV using annotations.
+// This pass is inserted in the optimization pipeline immediately before the
+// loop vectorizer.  When enabled, it retrieves the innermost loops of the
+// function (as done in LoopVectorize), compiles them ahead with different
+// vectorization factors and evaluates the costs according to some metric.  The
+// best option is chosen and vectorization hints are added accordingly.
+//
+// In a bit more detail: each loop is extracted into a new function in a fresh
+// module.  Several copies of the loop function are created, one for each
+// combination of vectorization, interleaving and optionally unrolling factor to
+// explore.  These are sent through a "clone" of the optimization and code
+// generation pipeline.  When they arrive at the ExplorativeLV pass in the
+// "child" pipeline, the factors are set as metadata.  Furthermore, inputs for
+// the loops functions are inferred if the benchmarking metric is in use.  After
+// optimization, unvectorized loops (that should have been vectorized) are
+// filtered out and annotations llvm-mca are added (if the mca metric is in
+// use).  After code generation, the costs of the options are evaluated, either
+// using the MachineCodeExplorer (inst-count metric, actually the last pass
+// which is part of the code generation pipeline), llvm-mca or via benchmarking.
 //
 //===----------------------------------------------------------------------===//
 
@@ -38,6 +45,11 @@ class ExplorativeLVPass : public PassInfoMixin<ExplorativeLVPass> {
 public:
   class InputBuilder;
 
+  /// Available metrics
+  ///
+  /// `Disable` disables the pass entirely, `Dummy` does not disable it but does
+  /// not peform any exploration. This can be useful to enforce vectorization
+  /// factors for a specific loop.
   enum class Metric { Disable, Dummy, InstCount, MCA, Benchmark };
 
   friend struct MachineCodeExplorer;
@@ -68,16 +80,16 @@ private:
 
   OptPipelineContainer *OptPipeline = nullptr;
 
-  // Code generation pipeline with no output
-  // This is used for instruction count mode.  Otherwise we need to rebuild
-  // the pipeline every time, since we cannot simply replace the output stream.
+  /// Code generation pipeline with no output
+  /// This is used for instruction count mode.  Otherwise we need to rebuild
+  /// the pipeline every time, since we cannot simply replace the output stream.
   NullCGPipelineContainer *NullCGPipeline = nullptr;
 
   bool processLoop(Function &F, Loop &L, unsigned LoopNo, ScalarEvolution &SE,
                    TargetLibraryInfo &TLI);
 
-  // For benchmarking mode: It is easier to infer the inputs in the "children"
-  // pipelines.  This is used to pass them back to the "parent" pipeline.
+  /// For benchmarking mode: It is easier to infer the inputs in the "children"
+  /// pipelines.  This is used to pass them back to the "parent" pipeline.
   InputBuilder *InferredInputs = nullptr;
 
   SmallVector<LoopFuncInfo, 0> LoopFuncInfos;
@@ -92,6 +104,7 @@ private:
 
   StringMap<std::tuple<unsigned, unsigned, unsigned>> ForcedFactors;
 
+  /// Used to retrieve paths for external programs once only.
   struct ProgramPaths {
     std::string cc() {
       assert(Status == 1 && !CC.empty());

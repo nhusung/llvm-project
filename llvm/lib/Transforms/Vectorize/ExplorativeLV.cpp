@@ -6,17 +6,24 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// This pass is inserted in the middle end pipeline immediately before the
-// loop vectorizer. When enabled, it retrieves the innermost loops of the
-// function like it is done for vectorization.
-// Each loop is copied into a plain function in a new module; for each
-// vectorization and interleaving factor within range (range can be adapted in
-// lines 659,660) the loop is annotated with pragmas to force the LV to choose
-// this VF and IF. Then it is sent through the compilation pipeline, stopping
-// at assembly file generation where MachineCodeExplorer.cpp computes a cost
-// estimate based on the machine code.
-// The VF-IF combination with the lowest cost is selected and forced onto the
-// LV using annotations.
+// This pass is inserted in the optimization pipeline immediately before the
+// loop vectorizer.  When enabled, it retrieves the innermost loops of the
+// function (as done in LoopVectorize), compiles them ahead with different
+// vectorization factors and evaluates the costs according to some metric.  The
+// best option is chosen and vectorization hints are added accordingly.
+//
+// In a bit more detail: each loop is extracted into a new function in a fresh
+// module.  Several copies of the loop function are created, one for each
+// combination of vectorization, interleaving and optionally unrolling factor to
+// explore.  These are sent through a "clone" of the optimization and code
+// generation pipeline.  When they arrive at the ExplorativeLV pass in the
+// "child" pipeline, the factors are set as metadata.  Furthermore, inputs for
+// the loops functions are inferred if the benchmarking metric is in use.  After
+// optimization, unvectorized loops (that should have been vectorized) are
+// filtered out and annotations llvm-mca are added (if the mca metric is in
+// use).  After code generation, the costs of the options are evaluated, either
+// using the MachineCodeExplorer (inst-count metric, actually the last pass
+// which is part of the code generation pipeline), llvm-mca or via benchmarking.
 //
 //===----------------------------------------------------------------------===//
 
@@ -176,6 +183,11 @@ static cl::opt<std::string>
 
 namespace {
 
+/// Represents a build artifact
+///
+/// Depending on whether `--xlv-artifacts-dir` is set, the artifact is either
+/// placed in the artifacts directory or created as a temporary file and removed
+/// when the `Artifact` object is destructed.
 struct Artifact {
   SmallString<32> Path;
 
@@ -184,6 +196,7 @@ struct Artifact {
       sys::fs::remove(Path);
   }
 
+  /// Creates an artifact placing the file descriptor in `ResultFD`
   std::error_code create(const Twine &Prefix, StringRef Suffix, int &ResultFD,
                          sys::fs::OpenFlags Flags = sys::fs::OF_None) {
     if (XLVArtifactsDir.empty())
@@ -196,6 +209,7 @@ struct Artifact {
                              sys::fs::FA_Read | sys::fs::FA_Write, Flags);
   }
 
+  /// Creates an artifact and closes the resulting file descriptor
   std::error_code create(const Twine &Prefix, StringRef Suffix,
                          sys::fs::OpenFlags Flags = sys::fs::OF_None) {
     int FD;
@@ -203,7 +217,7 @@ struct Artifact {
     if (EC)
       return EC;
     // FD is only needed to avoid race conditions or to ensure that the file is
-    // truncated, respectively. Close it right away.
+    // truncated, respectively.  Close it right away.
     sys::fs::file_t F = sys::fs::convertFDToNativeFile(FD);
     sys::fs::closeFile(F);
     return EC;
@@ -212,7 +226,11 @@ struct Artifact {
 
 } // end anonymous namespace
 
+/// Builder for the input arguments of loop functions (benchmarking metric)
+///
+/// Output arguments are handled separately.
 class ExplorativeLVPass::InputBuilder {
+  /// Ranges of memory accesses
   class MemAccessRange {
     friend class InputBuilder;
 
@@ -234,6 +252,10 @@ class ExplorativeLVPass::InputBuilder {
   SmallVector<MemAccessRange> MemRanges;
 
 public:
+  /// Adds a memory access
+  ///
+  /// \param Arg  the argument corresponding to the pointer
+  /// \param Loc  location relative to the pointer (in elements, not bytes)
   void addMemAccess(const Argument *Arg, int64_t Loc);
 
   /// Adds a memory access with a known end pointer.
@@ -245,6 +267,12 @@ public:
   void addMemAccessWithEndptr(const Argument *ArgStart, const Argument *ArgEnd,
                               uint64_t Diff);
 
+  /// Sets the argument to the desired value if not already set
+  ///
+  /// \param Arg      the argument
+  /// \param Desired  the desired integer value
+  ///
+  /// \return the value assigned to the argument
   APInt tryAddIntInput(const Argument *Arg, APInt &&Desired) {
     ConstantInt *&Input = IntInputs[Arg->getArgNo()];
     if (Input)
@@ -254,9 +282,17 @@ public:
     return Desired;
   }
 
+  /// Build the arguments
+  ///
+  /// \param M       the module (needed for static allocation of arrays)
+  /// \param Params  parameter types (to create null arguments for not yet
+  ///                defined parameters)
+  /// \param Args    output array of arguments
+  /// \param BB      the basic block to use for dynamically allocating memory
   void build(Module &M, ArrayRef<Type *> Params, SmallVectorImpl<Value *> &Args,
              BasicBlock *BB);
 
+  /// Sets the number of input arguments
   void setNumInputArgs(unsigned Num) {
     assert(IntInputs.size() == 0 && MemAccesses.size() == 0 &&
            "Must set NumInputArgs once only");
@@ -264,6 +300,7 @@ public:
     MemAccesses.assign(Num, None);
   }
 
+  /// Returns whether the given argument is an input argument
   bool isInputArg(const Argument *Arg) {
     return Arg->getArgNo() < IntInputs.size();
   }
@@ -368,6 +405,10 @@ void InputBuilder::build(Module &M, ArrayRef<Type *> Params,
 
 namespace {
 
+/// Builder for the module containing the loop functions
+///
+/// This is implemented as a ValueMaterializer to ease the cloning of the basic
+/// blocks belonging to the loop.
 class LoopModuleBuilder : public ValueMaterializer {
   const Function &OrigFunc;
   const Loop &L;
@@ -388,7 +429,16 @@ class LoopModuleBuilder : public ValueMaterializer {
 
   bool MakeExecutable;
 
+  /// Determines the inputs and outputs of the loop
+  ///
+  /// An input is a value that is defined outside the loop and used inside, an
+  /// output is a value that is defined inside and used outside.  These become
+  /// parameters of the loop function.
+  ///
+  /// \return true on success
   bool determineIO();
+
+  /// Build the function type
   void buildFuncTy();
 
 public:
@@ -400,12 +450,19 @@ public:
 
   Value *materialize(Value *V) override;
 
+  /// Returns the loop module, creating if not done yet
+  ///
+  /// \return the module or `nullptr` on error
   Module *getModule();
 
+  /// Builds the functions `main()`, `bench()` and `calib()` for the
+  /// benchmarking metric
+  ///
+  /// \param LoopFuncs  Loop functions with their metadata
   void buildMainFuncBody(ArrayRef<ExplorativeLVPass::LoopFuncInfo> LoopFuncs);
 
+  /// Builds a loop function for the given factors
   Function *buildLoopFunc(unsigned VF, unsigned IF, unsigned UF);
-  void filterOutUnvectorized(bool AddMCAAnnotations);
 
   InputBuilder &getInferredInputsRef() {
     assert(M && "No loop func has been built yet");
@@ -560,7 +617,7 @@ Value *LoopModuleBuilder::materialize(Value *V) {
   return nullptr;
 }
 
-// Builds the loop function type
+/// Builds the loop function type
 void LoopModuleBuilder::buildFuncTy() {
   SmallVector<Type *> Params;
   Params.reserve(Inputs.size() + Outputs.size());
@@ -1143,6 +1200,12 @@ void LoopModuleBuilder::buildMainFuncBody(
 
 } // end anonymous namespace
 
+/// Marks a region for `llvm-mca`
+///
+/// \param C      the LLVM context
+/// \param First  the basic block starting the region
+/// \param Last   the basic block ending the region
+/// \param ID     the id of the region
 static void addMCAAnnotation(LLVMContext &C, BasicBlock &First,
                              BasicBlock &Last, const Twine &ID) {
   const char SideEffects[] = "~{memory},~{dirflag},~{fpsr},~{flags}";
@@ -1157,6 +1220,11 @@ static void addMCAAnnotation(LLVMContext &C, BasicBlock &First,
   CallInst::Create(Ty, EndAsm, "", Last.getTerminator());
 }
 
+/// Finds a latch in the given function
+///
+/// \param F  the function
+///
+/// \return  the latch or `nullptr` if none found
 static BasicBlock *findSomeLatch(Function &F) {
   for (BasicBlock &BB : F) {
     if (BB.getTerminator()->getMetadata(LLVMContext::MD_loop))
@@ -1165,6 +1233,13 @@ static BasicBlock *findSomeLatch(Function &F) {
   return nullptr;
 }
 
+/// Finds a latch of a vectorized loop in the given function
+///
+/// Relies on the `llvm.loop.isvectorized metadata`
+///
+/// \param F  the function
+///
+/// \return  the latch or `nullptr` if none found
 static BasicBlock *findLatchOfVectorizedLoop(Function &F) {
   for (BasicBlock &BB : F) {
     const MDNode *MD = findOptionMDForLoopID(
@@ -1189,6 +1264,12 @@ static BasicBlock *findLatchOfVectorizedLoop(Function &F) {
   return nullptr;
 }
 
+/// Find a the start basic block to use for `llvm-mca` markers
+///
+/// \param F      the function
+/// \param Latch  the latch
+///
+/// \return the start basic block
 static BasicBlock &getMCAStart(Function &F, BasicBlock &Latch) {
   // Sadly, there is no simple way access the LoopInfo here ...
   //
@@ -1218,6 +1299,8 @@ static BasicBlock &getMCAStart(Function &F, BasicBlock &Latch) {
   return *First;
 }
 
+/// Checks whether the given list of basic block contains an instruction of
+/// vector type
 static bool containsVectorInstruction(Function::BasicBlockListType &BBs) {
   for (BasicBlock &BB : BBs) {
     for (Instruction &Inst : BB) {
@@ -1228,6 +1311,10 @@ static bool containsVectorInstruction(Function::BasicBlockListType &BBs) {
   return false;
 }
 
+/// Filters out loop functions whose loops should have been vectorized but
+/// were not
+///
+/// \param AddMCAAnnotations  also add annotations for llvm-mca
 static void filterOutUnvectorized(
     SmallVectorImpl<ExplorativeLVPass::LoopFuncInfo> &LoopFuncs,
     bool AddMCAAnnotations) {
@@ -1238,6 +1325,8 @@ static void filterOutUnvectorized(
     Function &F = *Info.Func;
     Function::BasicBlockListType &BBs = F.getBasicBlockList();
 
+    // FIXME: we should not search for a latch this way.  It does not work
+    // in conjunction with loop unrolling
     BasicBlock *Latch = findSomeLatch(F);
     if (Latch) {
       if (Info.VF > 1 || Info.IF > 1)
@@ -1275,10 +1364,16 @@ static void filterOutUnvectorized(
   }
 }
 
-// The more complex approach, using the runtime estimation mechanisms
-// already present in LLVM: llvm-mca
-//
-// Returns whether errors occured
+/// Run `llvm-mca`
+///
+/// \param MCAPath       the path to the `llvm-mca` binary
+/// \param FileName      the path to the assembly file
+/// \param OutputStem    the stem for the json output file
+/// \param TargetCPU     the target cpu (`--mcpu` option)
+/// \param TargetTriple  the target triple (`--mtriple` option)
+/// \param Callback      callback function taking loop id and estimated costs
+///
+/// \return whether an error occured
 template <typename FuncT>
 static bool performMCACostCalc(std::string MCAPath, StringRef FileName,
                                const Twine &OutputStem, StringRef TargetCPU,
@@ -1331,9 +1426,10 @@ static bool performMCACostCalc(std::string MCAPath, StringRef FileName,
   return false;
 }
 
-// Add to the given pass manager everything we need to simulate our backend
-// pipeline
-// ~~> EmitAssemblyHelper::AddEmitPasses in clang's BackendUtil
+/// Adds to the given pass manager everything we need to simulate our backend
+/// pipeline
+///
+/// ~~> EmitAssemblyHelper::AddEmitPasses in clang's BackendUtil
 static void initCodeGen(legacy::PassManager &PM, TargetMachine &TM,
                         ExplorativeLVPass *XLV, const TargetLibraryInfo &TLI,
                         raw_pwrite_stream &OS, CodeGenFileType CGFT) {
@@ -1350,6 +1446,10 @@ static void initCodeGen(legacy::PassManager &PM, TargetMachine &TM,
   TM.addPassesToEmitFile(PM, OS, nullptr, CGFT, /* DisableVerify */ false);
 }
 
+/// Container for the optimization pipeline
+///
+/// We need a reference type to use the move constructor for the ExplorativeLV
+/// pass
 struct ExplorativeLVPass::OptPipelineContainer {
   PassInstrumentationCallbacks PIC;
   StandardInstrumentations SI;
@@ -1393,6 +1493,7 @@ struct ExplorativeLVPass::OptPipelineContainer {
     MPM = PB.buildPerModuleDefaultPipeline(OptimizationLevel::O3);
   }
 
+  /// Runs the optimization pipeline on the given module
   void run(Module &M) {
     // This line "fixes" a bug where sometimes, starting the PM run will
     // trigger an invalid invalidation...
@@ -1403,6 +1504,9 @@ struct ExplorativeLVPass::OptPipelineContainer {
   }
 };
 
+/// Container for the code generation pipeline with output to null
+///
+/// This is used for the inst-count metric.  We can reuse this pipeline!
 struct ExplorativeLVPass::NullCGPipelineContainer {
   raw_null_ostream OS;
   legacy::PassManager PM;
@@ -1413,12 +1517,17 @@ struct ExplorativeLVPass::NullCGPipelineContainer {
   }
 };
 
+/// Container for the CSV output file `--xlv-csv-out`
 struct ExplorativeLVPass::CSVOutputContainer {
   std::error_code EC;
   raw_fd_ostream OS;
   CSVOutputContainer() : OS(XLVCSVOut, EC) {}
 };
 
+/// Parse the factors specified by `--xlv-force-factors`
+///
+/// \param ForcedFactors  resulting map from '<function>,<loop name>' to
+///                       (VF, IF, UF)
 static void parseXLVForceFactors(
     StringMap<std::tuple<unsigned, unsigned, unsigned>> &ForcedFactors) {
   StringRef Remainder = StringRef(XLVForceFactors), LoopEntry, FacStr;
@@ -1454,7 +1563,9 @@ ExplorativeLVPass::~ExplorativeLVPass() {
   delete CSVOutput;
 }
 
-// Inspired by addStringMetadataToLoop from LoopUtils
+/// Sets the VF, IF and UF metadata for a given loop
+///
+/// Inspired by addStringMetadataToLoop from LoopUtils
 static void setFactorMetadata(Loop &L, unsigned VF, unsigned IF, unsigned UF) {
   LLVMContext &Context = L.getHeader()->getContext();
   Type *I32Ty = Type::getInt32Ty(Context);
@@ -1525,7 +1636,15 @@ static void setFactorMetadata(Loop &L, unsigned VF, unsigned IF, unsigned UF) {
   L.setLoopID(NewLoopID);
 }
 
-// returns whether an error occured
+/// Processes a loop (in the main pipeline)
+///
+/// \param F       the function
+/// \param L       the loop
+/// \param LoopNo  the number of the loop in the function
+/// \param SE      scalar evolution info
+/// \param TLI     target library info needed for the code generation pipeline
+///
+/// \return  whether an error occured
 bool ExplorativeLVPass::processLoop(Function &F, Loop &L, unsigned LoopNo,
                                     ScalarEvolution &SE,
                                     TargetLibraryInfo &TLI) {
@@ -1834,7 +1953,13 @@ output_csv:
   return Errors;
 }
 
-// Inspired by LoopVectorize.cpp
+/// Collects the innermost loops
+///
+/// Inspired by LoopVectorize.cpp
+///
+/// \param L   a loop to start with
+/// \param LI  the loop information
+/// \param V   the vector of collected loops
 static void collectSupportedLoops(Loop &L, LoopInfo *LI,
                                   SmallVectorImpl<Loop *> &V) {
   if (L.isInnermost()) {
@@ -1947,6 +2072,10 @@ public:
   }
 };
 
+/// Analyzer for the backedge taken count SCEV
+///
+/// Attemts to choose inputs such that the loop is executed the desired number
+/// of iterations.
 class SCEVBackedgeTakenAnalyzer
     : private SCEVCompVisitor<SCEVBackedgeTakenAnalyzer, APInt> {
   friend class SCEVCompVisitor<SCEVBackedgeTakenAnalyzer, APInt>;
@@ -2185,6 +2314,10 @@ public:
   }
 };
 
+/// Analyzer for memory access SCEVs
+///
+/// Tries to infer sizes of arrays and offsets such that no out-of-bounds
+/// accesses occur.
 class SCEVMemAccessAnalyzer : private SCEVCompVisitor<SCEVMemAccessAnalyzer> {
   friend class SCEVCompVisitor<SCEVMemAccessAnalyzer>;
 
@@ -2346,6 +2479,14 @@ public:
 
 } // end anonymous namespace
 
+/// Infers inputs suitable for benchmarking a loop function
+///
+/// This is to be called from the "child" pass
+///
+/// \param F               the loop function
+/// \param L               the loop
+/// \param SE              scalar evolution analysis
+/// \param InferredInputs  reference to the input builder
 static void inferInputs(const Function &F, Loop &L, ScalarEvolution &SE,
                         ExplorativeLVPass::InputBuilder &InferredInputs) {
   // Obtain/choose a trip count
@@ -2395,6 +2536,9 @@ static std::string getMainExecutable(const char *Name) {
   return sys::path::parent_path(COWPath).str();
 }
 
+/// Finds all program paths
+///
+/// \return true on success
 bool ExplorativeLVPass::ProgramPaths::findAll() {
   if (Status == 1)
     return true;

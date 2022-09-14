@@ -1,58 +1,32 @@
 # About This Project
 
-The code on this branch is the outcome of a Master thesis project of the
-Compiler Design Lab at Saarland University.
+This is a fork of the [LLVM project](https://github.com/llvm/llvm-project) where we aim to to improve the choice of loop vectorization factors using an explorative approach.
+The work started as a master's thesis “Determining the Perfect Vectorization Factor” by [Anna Welker](https://github.com/aWelker/llvm-project) at the Compiler Design Lab at Saarland University.
+Because the results were not as good as expected, Nils Husung picked up this project in his bachelor's thesis “Improving the Choice of Vectorization Factors,” also at the Compiler Design Lab.
 
-Based on LLVM release 12.0.1, we implemented an explorative approach to
-the problem of finding the best vectorization and interleaving factor for
-innermost loops.
+The main idea is to extract innermost loops into functions and compile them ahead via a clone of the optimization and the code generation pipeline.
+This is done by the `ExplorativeLV` pass implemented in `llvm/lib/Transforms/Vectorize/ExplorativeLV.cpp`.
+To evaluate the costs, there are three metrics available: a simple one focused on the instruction count (implementation in `llvm/lib/CodeGen/MachineCodeExplorer.cpp`), one based on [`llvm-mca`](https://www.llvm.org/docs/CommandGuide/llvm-mca.html) and a benchmarking metric.
+The benchmarking metric automatically infers “valid” inputs for the extracted loops and benchmarks them.
+The focus of the Bachelor's thesis was on this metric.
+The MCA metric is currently a little buggy because it does not reliably isolate the assembly of the vectorized loop.
 
-Roughly, the tool works as follows:
+To enable our explorative loop vectorization (XLV) with the benchmarking metric, invoke `clang` as follows:
 
-- A pass is inserted immediately before LoopVectorize that retrieves all
-  innermost loops from the function and copies each of them, to insert them
-  into a new function in a new module
-  
-- For every possible combination of vectorization and interleaving factor
-  within the ranges hard-coded in ExplorativeLV.cpp, the copied loop is
-  annotated such that LoopVectorize is forced to choose the factors and runs
-  through the compilation pipeline up until an assembly or object file would
-  be generated
-  
-- A pass at the very end of the backend pipeline calculates a cost estimate
-  for the generated machine code, which is used by the exploration pass to
-  determine the best combination of factors
-  
-- Finally, the combination that has been selected is forced onto the original
-  loop with annotations, such that the loop vectorizer will chose these
-  factors.
-  
-The implementation adds the following hidden command line arguments to
-enable and fine-tune compilation with the exploration tool:
+    clang -O3 -mllvm --xlv-metric=benchmark [<other flags>] <input>
 
-- `enable-explorative-lv`: Set to true in order to activate the tool
+If you are interested in the debugging output, add `-mllvm --debug-only=explorative-lv`.
+Also remember to select the appropriate target (e.g. `-march=x86-64-v3` for machines with AVX2).
+The ExplorativeLV pass has lots of configuration options.
+If you have compiled the `opt` tool, you can use `opt --help-hidden` to see all the options.
+These are prefixed with `--xlv`.
+A particularly helpful option for debugging/evaluation purposes might be `--xlv-artifacts-dir=<dir>`, which places all build artifacts created by the ExplorativeLV pass (optimized IR of the loop functions, benchmarking executable or assembly code with for `llvm-mca`) in the given directory.
 
-- `explore-plain`: By default, the tool's cost calculation only takes into
-  account machine code of blocks that are part of the loop, i.e., blocks
-  whose names contain the strings "`vector.`", "`while.`" or "`for.`". Set
-  this option to true if you want to base your result on the complete machine
-  code output.
-  
-- `explore-divide-by-vf`: Enable this option in order to make the exploration
-  pass divide the cost results by the vectorization factor when comparing
-  them. This shadows LoopVectorize's behaviour when computing vectorization
-  costs and increases the chance of higher factors being used.
-  
-- `explore-with-mca`: Set this argument to true in order to use `llvm-mca`
-  for the machine code cost estimation instead of the machine instruction
-  count. *Note: This only works on architectures for which llvm-mca is
-  available and can analyse machine code that may contain control structures*
+If you are interested in the evaluation of this tool, have a look at https://gitlab.cs.uni-saarland.de/s8nihusu/xlv-evaluation.
 
-More information about the project as well as an evaluation on an embedded
-Arm and an Intel© server architecture can be found here:
-_Thesis link to follow soon_
+---
 
-_From here on follows the original README of the LLVM project_
+From here on follows the original readme:
 
 # The LLVM Compiler Infrastructure
 
