@@ -1,6 +1,6 @@
 # About This Project
 
-This is a fork of the [LLVM project](https://github.com/llvm/llvm-project) where we aim to to improve the choice of loop vectorization factors using an explorative approach.
+This is a fork of the [LLVM project](https://github.com/llvm/llvm-project) where we aim to improve the choice of loop vectorization factors using an explorative approach.
 The work started as a master's thesis “Determining the Perfect Vectorization Factor” by [Anna Welker](https://github.com/aWelker/llvm-project) at the Compiler Design Lab at Saarland University.
 Because the results were not as good as expected, Nils Husung picked up this project in his bachelor's thesis “Improving the Choice of Vectorization Factors,” also at the Compiler Design Lab.
 
